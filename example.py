@@ -1,5 +1,8 @@
 """
-Quick-start example — runs all four built-in strategies on synthetic ES data.
+Quick-start example — runs all four built-in strategies on NQ futures data.
+
+Uses DataFeed.from_yfinance() to pull real NQ=F data, with a synthetic
+fallback if the download fails (e.g. no internet connection).
 
 Run with:
     python example.py
@@ -19,36 +22,41 @@ from strategies.rsi_mean_reversion import RSIMeanReversionStrategy
 from strategies.breakout import BreakoutStrategy
 from strategies.trend_following import TrendFollowingStrategy
 
+# NQ (Nasdaq-100 E-mini) contract spec
+NQ_SYMBOL          = "NQ=F"
+NQ_MULTIPLIER      = 20.0    # $20 per point
+NQ_INITIAL_MARGIN  = 21_000.0
+NQ_MAINT_MARGIN    = 19_000.0
+NQ_TICK_SIZE       = 0.25
+INITIAL_CASH       = 500_000.0
+
 
 # ---------------------------------------------------------------------------
-# Generate realistic-ish synthetic ES futures data
+# Fallback: synthetic NQ-like bars
 # ---------------------------------------------------------------------------
 
-def make_synthetic_bars(n: int = 500, symbol: str = "ES") -> List[Bar]:
+def make_synthetic_nq_bars(n: int = 500) -> List[Bar]:
     random.seed(1234)
     base = datetime(2021, 1, 4)
     bars = []
-    price = 3700.0
+    price = 13_000.0
     for i in range(n):
-        # Random-walk with slight upward drift
-        change = random.gauss(0.5, 15.0)
+        change = random.gauss(2.0, 80.0)   # NQ moves more than ES
         open_ = price
         close = open_ + change
-        high = max(open_, close) + abs(random.gauss(0, 5))
-        low = min(open_, close) - abs(random.gauss(0, 5))
-        bars.append(
-            Bar(
-                timestamp=base + timedelta(days=i),
-                symbol=symbol,
-                open=round(open_, 2),
-                high=round(high, 2),
-                low=round(low, 2),
-                close=round(close, 2),
-                volume=round(random.uniform(50_000, 200_000)),
-                open_interest=round(random.uniform(2_000_000, 3_000_000)),
-                contract_multiplier=50.0,
-            )
-        )
+        high = max(open_, close) + abs(random.gauss(0, 20))
+        low  = min(open_, close) - abs(random.gauss(0, 20))
+        bars.append(Bar(
+            timestamp=base + timedelta(days=i),
+            symbol=NQ_SYMBOL,
+            open=round(open_, 2),
+            high=round(high, 2),
+            low=round(low, 2),
+            close=round(close, 2),
+            volume=round(random.uniform(20_000, 80_000)),
+            open_interest=round(random.uniform(200_000, 400_000)),
+            contract_multiplier=NQ_MULTIPLIER,
+        ))
         price = close
     return bars
 
@@ -57,27 +65,24 @@ def make_synthetic_bars(n: int = 500, symbol: str = "ES") -> List[Bar]:
 # Helper to run a single strategy
 # ---------------------------------------------------------------------------
 
-def run_strategy(strategy, bars: List[Bar], initial_cash: float = 500_000.0):
-    symbol = bars[0].symbol
-    feed = DataFeed(bars)
+def run_strategy(strategy, feed: DataFeed) -> object:
     margin_specs = {
-        symbol: MarginSpec(
-            symbol=symbol,
-            initial_margin_per_contract=12_000.0,
-            maintenance_margin_per_contract=10_900.0,
-            contract_multiplier=50.0,
+        NQ_SYMBOL: MarginSpec(
+            symbol=NQ_SYMBOL,
+            initial_margin_per_contract=NQ_INITIAL_MARGIN,
+            maintenance_margin_per_contract=NQ_MAINT_MARGIN,
+            contract_multiplier=NQ_MULTIPLIER,
         )
     }
     portfolio = Portfolio(
-        initial_cash=initial_cash,
+        initial_cash=INITIAL_CASH,
         margin_specs=margin_specs,
-        commission_per_contract=2.0,   # $2 per contract per side
-        slippage_ticks=1,              # 1 tick slippage
-        tick_size=0.25,
+        commission_per_contract=2.0,
+        slippage_ticks=1,
+        tick_size=NQ_TICK_SIZE,
     )
     engine = BacktestEngine(feed, portfolio, [strategy], verbose=False)
-    result = engine.run()
-    return result
+    return engine.run()
 
 
 # ---------------------------------------------------------------------------
@@ -85,7 +90,20 @@ def run_strategy(strategy, bars: List[Bar], initial_cash: float = 500_000.0):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    bars = make_synthetic_bars(500)
+    # Try to load real NQ data from Yahoo Finance
+    feed = None
+    try:
+        print("Downloading NQ=F data from Yahoo Finance...")
+        feed = DataFeed.from_yfinance(
+            NQ_SYMBOL,
+            contract_multiplier=NQ_MULTIPLIER,
+            warmup_bars=50,
+            period="3y",
+            interval="1d",
+        )
+        print(f"Loaded {feed._total} bars of real NQ data.\n")
+    except Exception as e:
+        print(f"Download failed ({e}), using synthetic data.\n")
 
     strategies = [
         EMACrossoverStrategy(fast_period=9, slow_period=21, contracts=1),
@@ -95,16 +113,19 @@ if __name__ == "__main__":
     ]
 
     for strat in strategies:
-        result = run_strategy(strat, bars)
-        print(f"\nStrategy: {strat.name}")
-        result.print_summary()
+        # Each strategy gets a fresh feed from the same data
+        if feed is not None:
+            strategy_feed = DataFeed.from_yfinance(
+                NQ_SYMBOL,
+                contract_multiplier=NQ_MULTIPLIER,
+                warmup_bars=50,
+                period="3y",
+                interval="1d",
+            )
+        else:
+            strategy_feed = DataFeed(make_synthetic_nq_bars(500))
 
-    # --- Example: load from CSV ---
-    # from backtesting.data_feed import DataFeed
-    # feed = DataFeed.from_csv(
-    #     "data/ES_daily.csv",
-    #     symbol="ES",
-    #     contract_multiplier=50.0,
-    #     warmup_bars=50,
-    # )
-    # ... then build Portfolio and BacktestEngine as above
+        result = run_strategy(strat, strategy_feed)
+        print(f"Strategy: {strat.name}")
+        result.print_summary()
+        print()
