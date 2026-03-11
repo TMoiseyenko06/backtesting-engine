@@ -12,7 +12,6 @@ Rules enforced here:
 
 from __future__ import annotations
 
-import csv
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -139,6 +138,102 @@ class DataFeed:
     # ------------------------------------------------------------------
 
     @classmethod
+    def from_yfinance(
+        cls,
+        ticker: str,
+        contract_multiplier: float = 1.0,
+        warmup_bars: int = 0,
+        symbol: Optional[str] = None,
+        **download_kwargs,
+    ) -> "DataFeed":
+        """
+        Download data directly from Yahoo Finance and return a DataFeed.
+
+        Parameters
+        ----------
+        ticker : str
+            Yahoo Finance ticker symbol, e.g. ``"ES=F"``, ``"NQ=F"``, ``"CL=F"``.
+        contract_multiplier : float
+            Contract size multiplier for P&L calculation.
+        warmup_bars : int
+            Number of bars to consume silently before the engine starts trading.
+        symbol : str | None
+            Override the symbol name stored in each Bar (defaults to ``ticker``).
+        **download_kwargs
+            Passed directly to ``yfinance.download()``.  Common options:
+              - ``start`` / ``end``  (str "YYYY-MM-DD")
+              - ``period``           (str "1y", "2y", "5y", "max", …)
+              - ``interval``         (str "1d", "1h", "30m", …)
+              - ``auto_adjust``      (bool, default True)
+
+        Examples
+        --------
+        >>> feed = DataFeed.from_yfinance("ES=F", contract_multiplier=50,
+        ...                               period="3y", interval="1d")
+
+        >>> feed = DataFeed.from_yfinance("NQ=F", contract_multiplier=20,
+        ...                               start="2020-01-01", end="2024-01-01")
+        """
+        try:
+            import yfinance as yf
+        except ImportError:
+            raise ImportError(
+                "yfinance is not installed. Run: pip install yfinance"
+            )
+
+        kwargs = {"progress": False, "auto_adjust": True}
+        kwargs.update(download_kwargs)
+
+        df = yf.download(ticker, **kwargs)
+
+        if df.empty:
+            raise ValueError(
+                f"yfinance returned no data for ticker '{ticker}'. "
+                "Check the symbol and date range."
+            )
+
+        # yfinance returns a MultiIndex when downloading a single ticker with
+        # recent versions: columns are (Price, Ticker) tuples.
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [price_level.lower() for price_level, _ in df.columns]
+        else:
+            df.columns = [c.lower() for c in df.columns]
+
+        # The date is in the index (named 'Date' or 'Datetime')
+        df = df.reset_index()
+        idx_col = df.columns[0]  # 'Date' or 'Datetime'
+        df = df.rename(columns={idx_col: "timestamp"})
+
+        # Drop rows with NaN OHLCV (can appear at end of intraday data)
+        df = df.dropna(subset=["open", "high", "low", "close", "volume"])
+        df["timestamp"] = pd.to_datetime(df["timestamp"])
+
+        # Strip timezone info — engine uses naive datetimes internally
+        if hasattr(df["timestamp"].dtype, "tz") and df["timestamp"].dt.tz is not None:
+            df["timestamp"] = df["timestamp"].dt.tz_localize(None)
+
+        df = df.sort_values("timestamp").reset_index(drop=True)
+
+        bar_symbol = symbol or ticker
+        oi_col = "open_interest" if "open_interest" in df.columns else None
+
+        bars = [
+            Bar(
+                timestamp=row["timestamp"].to_pydatetime(),
+                symbol=bar_symbol,
+                open=float(row["open"]),
+                high=float(row["high"]),
+                low=float(row["low"]),
+                close=float(row["close"]),
+                volume=float(row["volume"]),
+                open_interest=float(row[oi_col]) if oi_col else 0.0,
+                contract_multiplier=contract_multiplier,
+            )
+            for _, row in df.iterrows()
+        ]
+        return cls(bars, warmup_bars=warmup_bars)
+
+    @classmethod
     def from_dataframe(
         cls,
         df: pd.DataFrame,
@@ -149,13 +244,24 @@ class DataFeed:
         """
         Build a DataFeed from a pandas DataFrame.
 
+        Handles both flat and MultiIndex column DataFrames (e.g. from yfinance).
         Expected columns (case-insensitive):
             timestamp | datetime | date  →  parsed as datetime
             open, high, low, close, volume
         Optional: open_interest
         """
         df = df.copy()
-        df.columns = [c.lower() for c in df.columns]
+
+        # Flatten MultiIndex columns (yfinance returns these for single tickers)
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [price_level.lower() for price_level, _ in df.columns]
+        else:
+            df.columns = [c.lower() for c in df.columns]
+
+        # If date is in the index rather than a column, move it to a column
+        if df.index.name and df.index.name.lower() in ("date", "datetime", "timestamp", "time"):
+            df = df.reset_index()
+            df = df.rename(columns={df.columns[0]: "timestamp"})
 
         # Normalise timestamp column
         ts_col = next(
@@ -165,6 +271,11 @@ class DataFeed:
         if ts_col is None:
             raise ValueError("DataFrame must have a timestamp/datetime/date column")
         df["timestamp"] = pd.to_datetime(df[ts_col])
+
+        # Strip timezone info
+        if hasattr(df["timestamp"].dtype, "tz") and df["timestamp"].dt.tz is not None:
+            df["timestamp"] = df["timestamp"].dt.tz_localize(None)
+
         df = df.sort_values("timestamp").reset_index(drop=True)
 
         oi_col = "open_interest" if "open_interest" in df.columns else None
