@@ -1,8 +1,11 @@
 """
-Quick-start example — runs all four built-in strategies on NQ futures data.
+Futures Backtesting Example — NQ across multiple timeframes.
 
-Uses DataFeed.from_yfinance() to pull real NQ=F data, with a synthetic
-fallback if the download fails (e.g. no internet connection).
+Runs all four built-in strategies on each of:
+    1m  · 5m  · 15m  · 1h  · 4h
+
+Real data is pulled from Yahoo Finance (NQ=F).
+A synthetic fallback is used if the download fails.
 
 Run with:
     python example.py
@@ -22,67 +25,88 @@ from strategies.rsi_mean_reversion import RSIMeanReversionStrategy
 from strategies.breakout import BreakoutStrategy
 from strategies.trend_following import TrendFollowingStrategy
 
+
+# ---------------------------------------------------------------------------
 # NQ (Nasdaq-100 E-mini) contract spec
-NQ_SYMBOL          = "NQ=F"
-NQ_MULTIPLIER      = 20.0    # $20 per point
-NQ_INITIAL_MARGIN  = 21_000.0
-NQ_MAINT_MARGIN    = 19_000.0
-NQ_TICK_SIZE       = 0.25
-INITIAL_CASH       = 500_000.0
+# ---------------------------------------------------------------------------
+
+SYMBOL       = "NQ=F"
+MULTIPLIER   = 20.0       # $20 per point
+INIT_MARGIN  = 21_000.0
+MAINT_MARGIN = 19_000.0
+TICK_SIZE    = 0.25
+CASH         = 500_000.0
+
+# Timeframes to test.
+# period=None → DataFeed.from_yfinance auto-selects the maximum allowed period.
+# (interval, period, warmup_bars, label)
+TIMEFRAMES = [
+    ("1m",  None, 20, "1-Minute"),
+    ("5m",  None, 20, "5-Minute"),
+    ("15m", None, 20, "15-Minute"),
+    ("1h",  None, 20, "1-Hour"),
+    ("4h",  None, 10, "4-Hour"),
+]
 
 
 # ---------------------------------------------------------------------------
-# Fallback: synthetic NQ-like bars
+# Synthetic fallback — NQ-like prices at the right volatility scale
 # ---------------------------------------------------------------------------
 
-def make_synthetic_nq_bars(n: int = 500) -> List[Bar]:
-    random.seed(1234)
-    base = datetime(2021, 1, 4)
-    bars = []
-    price = 13_000.0
+def make_synthetic_bars(n: int, interval: str) -> List[Bar]:
+    random.seed(42)
+    base = datetime(2024, 1, 2, 9, 30)
+    vol = {"1m": 8, "5m": 18, "15m": 30, "1h": 60, "4h": 100}.get(interval, 40)
+    bars, price = [], 17_500.0
     for i in range(n):
-        change = random.gauss(2.0, 80.0)   # NQ moves more than ES
+        chg   = random.gauss(0, vol)
         open_ = price
-        close = open_ + change
-        high = max(open_, close) + abs(random.gauss(0, 20))
-        low  = min(open_, close) - abs(random.gauss(0, 20))
+        close = open_ + chg
+        high  = max(open_, close) + abs(random.gauss(0, vol * 0.3))
+        low   = min(open_, close) - abs(random.gauss(0, vol * 0.3))
         bars.append(Bar(
-            timestamp=base + timedelta(days=i),
-            symbol=NQ_SYMBOL,
+            timestamp=base + timedelta(minutes=i),
+            symbol=SYMBOL,
             open=round(open_, 2),
             high=round(high, 2),
             low=round(low, 2),
             close=round(close, 2),
-            volume=round(random.uniform(20_000, 80_000)),
-            open_interest=round(random.uniform(200_000, 400_000)),
-            contract_multiplier=NQ_MULTIPLIER,
+            volume=round(random.uniform(500, 5_000)),
+            contract_multiplier=MULTIPLIER,
         ))
         price = close
     return bars
 
 
 # ---------------------------------------------------------------------------
-# Helper to run a single strategy
+# Helpers
 # ---------------------------------------------------------------------------
 
+def load_feed(interval: str, period, warmup: int) -> DataFeed:
+    kwargs = {"interval": interval, "warmup_bars": warmup}
+    if period:
+        kwargs["period"] = period
+    return DataFeed.from_yfinance(SYMBOL, contract_multiplier=MULTIPLIER, **kwargs)
+
+
+def make_strategies() -> list:
+    return [
+        EMACrossoverStrategy(fast_period=9, slow_period=21, contracts=1),
+        RSIMeanReversionStrategy(rsi_period=14, oversold=30, overbought=70, contracts=1),
+        BreakoutStrategy(entry_period=20, exit_period=10, contracts=1),
+        TrendFollowingStrategy(ema_period=30, atr_period=14, risk_pct=0.01),
+    ]
+
+
 def run_strategy(strategy, feed: DataFeed) -> object:
-    margin_specs = {
-        NQ_SYMBOL: MarginSpec(
-            symbol=NQ_SYMBOL,
-            initial_margin_per_contract=NQ_INITIAL_MARGIN,
-            maintenance_margin_per_contract=NQ_MAINT_MARGIN,
-            contract_multiplier=NQ_MULTIPLIER,
-        )
-    }
     portfolio = Portfolio(
-        initial_cash=INITIAL_CASH,
-        margin_specs=margin_specs,
+        initial_cash=CASH,
+        margin_specs={SYMBOL: MarginSpec(SYMBOL, INIT_MARGIN, MAINT_MARGIN, MULTIPLIER)},
         commission_per_contract=2.0,
         slippage_ticks=1,
-        tick_size=NQ_TICK_SIZE,
+        tick_size=TICK_SIZE,
     )
-    engine = BacktestEngine(feed, portfolio, [strategy], verbose=False)
-    return engine.run()
+    return BacktestEngine(feed, portfolio, [strategy], verbose=False).run()
 
 
 # ---------------------------------------------------------------------------
@@ -90,42 +114,34 @@ def run_strategy(strategy, feed: DataFeed) -> object:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    # Try to load real NQ data from Yahoo Finance
-    feed = None
-    try:
-        print("Downloading NQ=F data from Yahoo Finance...")
-        feed = DataFeed.from_yfinance(
-            NQ_SYMBOL,
-            contract_multiplier=NQ_MULTIPLIER,
-            warmup_bars=50,
-            period="3y",
-            interval="1d",
-        )
-        print(f"Loaded {feed._total} bars of real NQ data.\n")
-    except Exception as e:
-        print(f"Download failed ({e}), using synthetic data.\n")
+    for interval, period, warmup, label in TIMEFRAMES:
+        print(f"\n{'='*60}")
+        print(f"  TIMEFRAME: {label}  ({interval})")
+        print(f"{'='*60}")
 
-    strategies = [
-        EMACrossoverStrategy(fast_period=9, slow_period=21, contracts=1),
-        RSIMeanReversionStrategy(rsi_period=14, oversold=30, overbought=70, contracts=1),
-        BreakoutStrategy(entry_period=20, exit_period=10, contracts=1),
-        TrendFollowingStrategy(ema_period=30, atr_period=14, risk_pct=0.01),
-    ]
+        # Download once; reuse bar list across all strategies
+        try:
+            print(f"  Downloading NQ=F {interval} data from Yahoo Finance...")
+            master_feed = load_feed(interval, period, warmup)
+            bars = master_feed._bars
+            print(f"  Loaded {len(bars)} bars.\n")
+        except Exception as e:
+            n = {"1m": 500, "5m": 400, "15m": 300, "1h": 200, "4h": 100}[interval]
+            print(f"  Download failed ({e}), using {n} synthetic bars.\n")
+            bars = make_synthetic_bars(n, interval)
 
-    for strat in strategies:
-        # Each strategy gets a fresh feed from the same data
-        if feed is not None:
-            strategy_feed = DataFeed.from_yfinance(
-                NQ_SYMBOL,
-                contract_multiplier=NQ_MULTIPLIER,
-                warmup_bars=50,
-                period="3y",
-                interval="1d",
+        for strat in make_strategies():
+            # Each strategy gets a fresh feed cursor from the same bar list
+            feed = DataFeed(bars, warmup_bars=warmup)
+            result = run_strategy(strat, feed)
+            a = result.analytics
+            print(
+                f"  {strat.name:<38} "
+                f"Return: {a.total_return_pct:>+7.2f}%  "
+                f"Trades: {a.total_trades:>3}  "
+                f"WinRate: {a.win_rate:>5.1f}%  "
+                f"Sharpe: {a.sharpe_ratio:>6.3f}  "
+                f"MaxDD: {a.max_drawdown_pct:>5.2f}%"
             )
-        else:
-            strategy_feed = DataFeed(make_synthetic_nq_bars(500))
 
-        result = run_strategy(strat, strategy_feed)
-        print(f"Strategy: {strat.name}")
-        result.print_summary()
-        print()
+    print()

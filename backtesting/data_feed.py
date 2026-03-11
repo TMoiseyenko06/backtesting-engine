@@ -137,6 +137,20 @@ class DataFeed:
     # Factory helpers
     # ------------------------------------------------------------------
 
+    # Maximum lookback period yfinance supports per intraday interval.
+    # Exceeding these silently returns truncated or empty data.
+    _YF_MAX_PERIOD: dict = {
+        "1m":  "7d",
+        "2m":  "60d",
+        "5m":  "60d",
+        "15m": "60d",
+        "30m": "60d",
+        "60m": "730d",
+        "1h":  "730d",
+        "4h":  "60d",   # undocumented but works in practice
+        "90m": "60d",
+    }
+
     @classmethod
     def from_yfinance(
         cls,
@@ -152,7 +166,7 @@ class DataFeed:
         Parameters
         ----------
         ticker : str
-            Yahoo Finance ticker symbol, e.g. ``"ES=F"``, ``"NQ=F"``, ``"CL=F"``.
+            Yahoo Finance ticker symbol, e.g. ``"NQ=F"``, ``"ES=F"``, ``"CL=F"``.
         contract_multiplier : float
             Contract size multiplier for P&L calculation.
         warmup_bars : int
@@ -161,17 +175,39 @@ class DataFeed:
             Override the symbol name stored in each Bar (defaults to ``ticker``).
         **download_kwargs
             Passed directly to ``yfinance.download()``.  Common options:
-              - ``start`` / ``end``  (str "YYYY-MM-DD")
-              - ``period``           (str "1y", "2y", "5y", "max", …)
-              - ``interval``         (str "1d", "1h", "30m", …)
-              - ``auto_adjust``      (bool, default True)
+
+            interval : str
+                ``"1m"``, ``"5m"``, ``"15m"``, ``"1h"``, ``"4h"``, ``"1d"`` …
+                If omitted, defaults to ``"1d"``.
+            period : str
+                ``"7d"``, ``"60d"``, ``"730d"``, ``"3y"``, ``"max"`` …
+                If omitted, the maximum allowed period for the interval is used
+                automatically so you never silently get truncated data.
+            start / end : str
+                Alternative to ``period``, e.g. ``start="2023-01-01"``.
+            auto_adjust : bool
+                Default ``True``.
+
+        yfinance intraday limits
+        ------------------------
+        =======  ==========
+        1m       last 7 days
+        5m       last 60 days
+        15m      last 60 days
+        1h       last 730 days
+        4h       last 60 days
+        =======  ==========
 
         Examples
         --------
-        >>> feed = DataFeed.from_yfinance("ES=F", contract_multiplier=50,
-        ...                               period="3y", interval="1d")
+        >>> feed = DataFeed.from_yfinance("NQ=F", contract_multiplier=20,
+        ...                               interval="5m")          # 60-day default
 
         >>> feed = DataFeed.from_yfinance("NQ=F", contract_multiplier=20,
+        ...                               interval="1h", period="730d")
+
+        >>> feed = DataFeed.from_yfinance("NQ=F", contract_multiplier=20,
+        ...                               interval="1d",
         ...                               start="2020-01-01", end="2024-01-01")
         """
         try:
@@ -183,6 +219,16 @@ class DataFeed:
 
         kwargs = {"progress": False, "auto_adjust": True}
         kwargs.update(download_kwargs)
+
+        # Default interval to daily
+        interval = kwargs.setdefault("interval", "1d")
+
+        # Auto-set max period for intraday intervals when the caller hasn't
+        # specified either period or start/end — prevents silent truncation.
+        if "period" not in kwargs and "start" not in kwargs and "end" not in kwargs:
+            max_period = cls._YF_MAX_PERIOD.get(interval)
+            if max_period:
+                kwargs["period"] = max_period
 
         df = yf.download(ticker, **kwargs)
 
