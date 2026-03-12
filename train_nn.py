@@ -1,0 +1,287 @@
+"""
+Neural Network ICT Strategy — Training Script
+=============================================
+
+What this script does
+---------------------
+1. Loads bar data (cache → Yahoo Finance → synthetic fallback)
+2. Engineers ICT features (FVG, order blocks, swing levels, kill zones …)
+3. Generates ATR-normalised labels (Buy / Flat / Sell)
+4. Trains the LSTM via walk-forward cross-validation
+5. Saves the best model to models/nn_ict_<interval>.pt
+6. Runs a backtest with the trained model and prints results
+
+Walk-forward CV explained
+--------------------------
+Instead of a random train/test split (which leaks future prices into training),
+the data is split chronologically:
+
+    |--- train fold 0 ---|--- val fold 0 ---|
+    |------ train fold 1 ------|--- val fold 1 ---|
+    …
+
+Each validation fold is strictly in the future relative to its training fold.
+If val accuracy is consistently close to train accuracy, the model generalises.
+If train acc >> val acc, the model is overfitting → increase dropout / reduce
+hidden_size / reduce seq_len.
+
+Run:
+    python train_nn.py                        # 5m bars, walk-forward CV
+    python train_nn.py --interval 1h          # hourly bars
+    python train_nn.py --no-wf               # simple 80/20 split (faster)
+"""
+
+from __future__ import annotations
+
+import argparse
+import random
+from datetime import datetime, timedelta
+from pathlib import Path
+
+import numpy as np
+import torch
+
+from backtesting.data_feed import Bar, DataFeed
+from backtesting.engine import BacktestEngine
+from backtesting.loaders.cache import save_feed, load_feed_from_cache
+from backtesting.ml.dataset import make_labels
+from backtesting.ml.features import ICTFeatureEngineer
+from backtesting.ml.model import LSTMSignalModel
+from backtesting.ml.trainer import Trainer
+from backtesting.portfolio import Portfolio, MarginSpec
+from strategies.nn_ict_strategy import NNICTStrategy
+
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+SYMBOL     = "NQ=F"
+MULTIPLIER = 20.0
+CASH       = 500_000.0
+INIT_MARGIN  = 21_000.0
+MAINT_MARGIN = 19_000.0
+TICK_SIZE    = 0.25
+
+CACHE_DIR  = Path("data")
+MODEL_DIR  = Path("models")
+
+# Training hyper-parameters (intentionally conservative)
+SEQ_LEN      = 30      # bars per LSTM input window
+HORIZON      = 12      # bars forward for label
+THRESHOLD    = 0.5     # ATR-normalised return needed to label Buy/Sell
+HIDDEN_SIZE  = 64
+EPOCHS       = 50
+LR           = 1e-3
+WEIGHT_DECAY = 0.05
+DROPOUT_LSTM = 0.3
+DROPOUT_FC   = 0.4
+BATCH_SIZE   = 64
+PATIENCE     = 10      # early stopping
+
+# Walk-forward params
+WF_TRAIN_BARS = 2000   # initial training window
+WF_VAL_BARS   = 500    # validation window per fold
+WF_STEP_BARS  = 500    # advance per fold
+
+
+# ---------------------------------------------------------------------------
+# Synthetic data (used if yfinance download fails)
+# ---------------------------------------------------------------------------
+
+def make_synthetic_bars(n: int, interval: str) -> list[Bar]:
+    random.seed(42)
+    np.random.seed(42)
+    base  = datetime(2023, 1, 2, 9, 30)
+    vol   = {"1m": 8, "5m": 18, "15m": 30, "1h": 60}.get(interval, 40)
+    mins  = {"1m": 1, "5m": 5, "15m": 15, "1h": 60}.get(interval, 5)
+    bars, price = [], 17_500.0
+    for i in range(n):
+        chg   = random.gauss(0, vol)
+        open_ = price
+        close = open_ + chg
+        high  = max(open_, close) + abs(random.gauss(0, vol * 0.3))
+        low   = min(open_, close) - abs(random.gauss(0, vol * 0.3))
+        bars.append(Bar(
+            timestamp=base + timedelta(minutes=i * mins),
+            symbol=SYMBOL,
+            open=round(open_, 2), high=round(high, 2),
+            low=round(low, 2),   close=round(close, 2),
+            volume=round(random.uniform(500, 5_000)),
+            contract_multiplier=MULTIPLIER,
+        ))
+        price = close
+    return bars
+
+
+# ---------------------------------------------------------------------------
+# Data loading
+# ---------------------------------------------------------------------------
+
+def load_bars(interval: str, warmup: int = 0) -> list[Bar]:
+    cache = CACHE_DIR / f"{SYMBOL.replace('=', '')}_{interval}.parquet"
+    try:
+        feed = load_feed_from_cache(cache, symbol=SYMBOL,
+                                    contract_multiplier=MULTIPLIER,
+                                    warmup_bars=warmup)
+        print(f"  Loaded {feed._total} bars from cache: {cache}")
+        return feed._bars
+    except FileNotFoundError:
+        pass
+
+    try:
+        print(f"  Downloading {interval} bars from Yahoo Finance …")
+        feed = DataFeed.from_yfinance(SYMBOL, interval=interval,
+                                      contract_multiplier=MULTIPLIER,
+                                      warmup_bars=warmup)
+        save_feed(feed, cache)
+        return feed._bars
+    except Exception as e:
+        n = {"1m": 1000, "5m": 3000, "15m": 2000, "1h": 1500}.get(interval, 2000)
+        print(f"  Download failed ({e}). Using {n} synthetic bars.")
+        return make_synthetic_bars(n, interval)
+
+
+# ---------------------------------------------------------------------------
+# Main
+# ---------------------------------------------------------------------------
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--interval", default="5m",
+                        choices=["1m", "5m", "15m", "1h"])
+    parser.add_argument("--no-wf", action="store_true",
+                        help="Use simple 80/20 split instead of walk-forward CV")
+    parser.add_argument("--device", default="cpu")
+    args = parser.parse_args()
+
+    interval = args.interval
+    MODEL_DIR.mkdir(exist_ok=True)
+    model_path = MODEL_DIR / f"nn_ict_{interval}.pt"
+
+    print(f"\n{'='*60}")
+    print(f"  NNICTStrategy training  ({interval})")
+    print(f"{'='*60}")
+
+    # ── 1. Load data ──────────────────────────────────────────────────
+    bars = load_bars(interval)
+    n = len(bars)
+    print(f"  Bars available: {n}")
+
+    if n < WF_TRAIN_BARS + WF_VAL_BARS:
+        print(f"  WARNING: only {n} bars — walk-forward needs "
+              f"{WF_TRAIN_BARS + WF_VAL_BARS}. Switching to simple split.")
+        args.no_wf = True
+
+    # ── 2. Feature engineering ────────────────────────────────────────
+    print("  Computing ICT features …")
+    engineer = ICTFeatureEngineer()
+    features = engineer.transform(bars)
+    print(f"  Feature matrix: {features.shape}  ({features.shape[1]} features)")
+
+    # ── 3. Labels ─────────────────────────────────────────────────────
+    closes = np.array([b.close for b in bars])
+    highs  = np.array([b.high  for b in bars])
+    lows   = np.array([b.low   for b in bars])
+    from backtesting.ml.features import ICTFeatureEngineer as FE
+    atr = FE._atr(highs, lows, closes, 14)
+
+    labels = make_labels(closes, atr, horizon=HORIZON, threshold=THRESHOLD)
+    buy_pct  = (labels == 2).mean() * 100
+    sell_pct = (labels == 0).mean() * 100
+    flat_pct = (labels == 1).mean() * 100
+    print(f"  Label distribution — Buy:{buy_pct:.1f}%  Sell:{sell_pct:.1f}%  Flat:{flat_pct:.1f}%")
+
+    # ── 4. Model ──────────────────────────────────────────────────────
+    torch.manual_seed(42)
+    model = LSTMSignalModel(
+        hidden_size=HIDDEN_SIZE,
+        lstm_dropout=DROPOUT_LSTM,
+        fc_dropout=DROPOUT_FC,
+    )
+    print(f"  Model parameters: {model.n_parameters:,}")
+
+    trainer = Trainer(
+        model=model,
+        seq_len=SEQ_LEN,
+        batch_size=BATCH_SIZE,
+        epochs=EPOCHS,
+        lr=LR,
+        weight_decay=WEIGHT_DECAY,
+        patience=PATIENCE,
+        device=args.device,
+    )
+
+    # ── 5. Train ──────────────────────────────────────────────────────
+    print()
+    if args.no_wf:
+        print("  Training (simple 80/20 split) …")
+        metrics = trainer.fit(features, labels, val_split=0.2)
+        print(f"  val_loss={metrics['val_loss']:.4f}  val_acc={metrics['val_acc']:.3f}")
+    else:
+        print("  Training (walk-forward CV) …")
+        fold_metrics = trainer.fit_walk_forward(
+            features, labels,
+            train_bars=WF_TRAIN_BARS,
+            val_bars=WF_VAL_BARS,
+            step_bars=WF_STEP_BARS,
+            save_path=model_path,
+        )
+        if fold_metrics:
+            avg_acc = np.mean([f["val_acc"] for f in fold_metrics])
+            avg_loss = np.mean([f["val_loss"] for f in fold_metrics])
+            print(f"\n  Avg val_acc={avg_acc:.3f}  avg_val_loss={avg_loss:.4f}")
+            print(
+                "\n  NOTE: val_acc ~33% = random (3 classes). "
+                "Target >38-42% for edge.\n"
+                "  Large gap (train_acc >> val_acc) = overfitting.\n"
+                "  Consistent val_acc across folds = good generalisation."
+            )
+
+    if not args.no_wf:
+        trainer.save(model_path)
+
+    # ── 6. Backtest ───────────────────────────────────────────────────
+    print(f"\n  Running backtest with trained model ({interval}) …")
+    strategy = NNICTStrategy(
+        model_path=model_path,
+        seq_len=SEQ_LEN,
+        min_confidence=0.50,
+        contracts=1,
+    )
+    test_bars = bars[int(n * 0.8):]       # hold-out last 20%
+    if len(test_bars) < SEQ_LEN + 50:
+        print("  Insufficient hold-out bars for backtest.")
+        return
+
+    feed = DataFeed(test_bars, warmup_bars=SEQ_LEN)
+    portfolio = Portfolio(
+        initial_cash=CASH,
+        margin_specs={SYMBOL: MarginSpec(SYMBOL, INIT_MARGIN, MAINT_MARGIN, MULTIPLIER)},
+        commission_per_contract=2.0,
+        slippage_ticks=1,
+        tick_size=TICK_SIZE,
+    )
+    result = BacktestEngine(feed, portfolio, [strategy], verbose=False).run()
+    a = result.analytics
+
+    print(f"\n  {'─'*50}")
+    print(f"  Hold-out backtest results (last 20% of bars)")
+    print(f"  {'─'*50}")
+    print(f"  Total return   : {a.total_return_pct:>+8.2f}%")
+    print(f"  Sharpe ratio   : {a.sharpe_ratio:>8.3f}")
+    print(f"  Max drawdown   : {a.max_drawdown_pct:>8.2f}%")
+    print(f"  Total trades   : {a.total_trades:>8}")
+    print(f"  Win rate       : {a.win_rate:>8.1f}%")
+    print(f"  {'─'*50}\n")
+    print(
+        "  Realistic expectations:\n"
+        "  - Sharpe > 0.5 on unseen data = viable edge\n"
+        "  - Sharpe > 1.0 = strong (rare for pure ML strategies)\n"
+        "  - Sharpe < 0.3 = no edge, needs more data / better features\n"
+        "  - Consistent across multiple hold-out periods = not overfit\n"
+    )
+
+
+if __name__ == "__main__":
+    main()
