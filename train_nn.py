@@ -1,15 +1,16 @@
 """
-Neural Network ICT Strategy — Training Script
-=============================================
+Neural Network ICT Strategy -- Training Script
+===============================================
 
 What this script does
 ---------------------
-1. Loads bar data (cache → Yahoo Finance → synthetic fallback)
-2. Engineers ICT features (FVG, order blocks, swing levels, kill zones …)
+1. Loads bar data (cache -> Yahoo Finance -> synthetic fallback)
+2. Engineers ICT features (FVG, order blocks, swing levels, kill zones ...)
 3. Generates ATR-normalised labels (Buy / Flat / Sell)
 4. Trains the LSTM via walk-forward cross-validation
-5. Saves the best model to models/nn_ict_<interval>.pt
-6. Runs a backtest with the trained model and prints results
+5. Saves the best model weights to  models/nn_ict_<interval>.pt
+6. Saves full training metrics to   models/nn_ict_<interval>_metrics.json
+7. Runs a hold-out backtest and prints results
 
 Walk-forward CV explained
 --------------------------
@@ -18,22 +19,28 @@ the data is split chronologically:
 
     |--- train fold 0 ---|--- val fold 0 ---|
     |------ train fold 1 ------|--- val fold 1 ---|
-    …
+    ...
 
 Each validation fold is strictly in the future relative to its training fold.
 If val accuracy is consistently close to train accuracy, the model generalises.
-If train acc >> val acc, the model is overfitting → increase dropout / reduce
+If train_acc >> val_acc, the model is overfitting -- increase dropout / reduce
 hidden_size / reduce seq_len.
+
+Saved files
+-----------
+  models/nn_ict_5m.pt              -- PyTorch model weights (reloadable)
+  models/nn_ict_5m_metrics.json    -- per-fold metrics + config + backtest result
 
 Run:
     python train_nn.py                        # 5m bars, walk-forward CV
     python train_nn.py --interval 1h          # hourly bars
-    python train_nn.py --no-wf               # simple 80/20 split (faster)
+    python train_nn.py --no-wf                # simple 80/20 split (faster)
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import random
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -77,7 +84,7 @@ WEIGHT_DECAY = 0.05
 DROPOUT_LSTM = 0.3
 DROPOUT_FC   = 0.4
 BATCH_SIZE   = 64
-PATIENCE     = 10      # early stopping
+PATIENCE     = 10      # early stopping patience
 
 # Walk-forward params
 WF_TRAIN_BARS = 2000   # initial training window
@@ -118,22 +125,20 @@ def make_synthetic_bars(n: int, interval: str) -> list[Bar]:
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_bars(interval: str, warmup: int = 0) -> list[Bar]:
+def load_bars(interval: str) -> list[Bar]:
     cache = CACHE_DIR / f"{SYMBOL.replace('=', '')}_{interval}.parquet"
     try:
         feed = load_feed_from_cache(cache, symbol=SYMBOL,
-                                    contract_multiplier=MULTIPLIER,
-                                    warmup_bars=warmup)
+                                    contract_multiplier=MULTIPLIER)
         print(f"  Loaded {feed._total} bars from cache: {cache}")
         return feed._bars
     except FileNotFoundError:
         pass
 
     try:
-        print(f"  Downloading {interval} bars from Yahoo Finance …")
+        print(f"  Downloading {interval} bars from Yahoo Finance ...")
         feed = DataFeed.from_yfinance(SYMBOL, interval=interval,
-                                      contract_multiplier=MULTIPLIER,
-                                      warmup_bars=warmup)
+                                      contract_multiplier=MULTIPLIER)
         save_feed(feed, cache)
         return feed._bars
     except Exception as e:
@@ -157,42 +162,42 @@ def main():
 
     interval = args.interval
     MODEL_DIR.mkdir(exist_ok=True)
-    model_path = MODEL_DIR / f"nn_ict_{interval}.pt"
+    model_path   = MODEL_DIR / f"nn_ict_{interval}.pt"
+    metrics_path = MODEL_DIR / f"nn_ict_{interval}_metrics.json"
 
     print(f"\n{'='*60}")
     print(f"  NNICTStrategy training  ({interval})")
     print(f"{'='*60}")
 
-    # ── 1. Load data ──────────────────────────────────────────────────
+    # 1. Load data
     bars = load_bars(interval)
     n = len(bars)
     print(f"  Bars available: {n}")
 
     if n < WF_TRAIN_BARS + WF_VAL_BARS:
-        print(f"  WARNING: only {n} bars — walk-forward needs "
+        print(f"  WARNING: only {n} bars -- walk-forward needs "
               f"{WF_TRAIN_BARS + WF_VAL_BARS}. Switching to simple split.")
         args.no_wf = True
 
-    # ── 2. Feature engineering ────────────────────────────────────────
-    print("  Computing ICT features …")
+    # 2. Feature engineering
+    print("  Computing ICT features ...")
     engineer = ICTFeatureEngineer()
     features = engineer.transform(bars)
     print(f"  Feature matrix: {features.shape}  ({features.shape[1]} features)")
 
-    # ── 3. Labels ─────────────────────────────────────────────────────
+    # 3. Labels
     closes = np.array([b.close for b in bars])
     highs  = np.array([b.high  for b in bars])
     lows   = np.array([b.low   for b in bars])
-    from backtesting.ml.features import ICTFeatureEngineer as FE
-    atr = FE._atr(highs, lows, closes, 14)
-
+    atr    = ICTFeatureEngineer._atr(highs, lows, closes, 14)
     labels = make_labels(closes, atr, horizon=HORIZON, threshold=THRESHOLD)
-    buy_pct  = (labels == 2).mean() * 100
-    sell_pct = (labels == 0).mean() * 100
-    flat_pct = (labels == 1).mean() * 100
-    print(f"  Label distribution — Buy:{buy_pct:.1f}%  Sell:{sell_pct:.1f}%  Flat:{flat_pct:.1f}%")
 
-    # ── 4. Model ──────────────────────────────────────────────────────
+    buy_pct  = float((labels == 2).mean() * 100)
+    sell_pct = float((labels == 0).mean() * 100)
+    flat_pct = float((labels == 1).mean() * 100)
+    print(f"  Label distribution -- Buy:{buy_pct:.1f}%  Sell:{sell_pct:.1f}%  Flat:{flat_pct:.1f}%")
+
+    # 4. Model
     torch.manual_seed(42)
     model = LSTMSignalModel(
         hidden_size=HIDDEN_SIZE,
@@ -212,24 +217,49 @@ def main():
         device=args.device,
     )
 
-    # ── 5. Train ──────────────────────────────────────────────────────
+    # Build the run log that will be saved to JSON
+    run_log: dict = {
+        "interval":   interval,
+        "trained_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "model_path": str(model_path),
+        "n_bars":     n,
+        "n_features": int(features.shape[1]),
+        "label_pct":  {"buy": round(buy_pct, 2),
+                       "sell": round(sell_pct, 2),
+                       "flat": round(flat_pct, 2)},
+        "hyperparams": {
+            "seq_len":      SEQ_LEN,
+            "horizon":      HORIZON,
+            "threshold":    THRESHOLD,
+            "hidden_size":  HIDDEN_SIZE,
+            "epochs":       EPOCHS,
+            "lr":           LR,
+            "weight_decay": WEIGHT_DECAY,
+            "batch_size":   BATCH_SIZE,
+            "patience":     PATIENCE,
+        },
+    }
+
+    # 5. Train
     print()
     if args.no_wf:
-        print("  Training (simple 80/20 split) …")
+        print("  Training (simple 80/20 split) ...")
         metrics = trainer.fit(features, labels, val_split=0.2)
         print(f"  val_loss={metrics['val_loss']:.4f}  val_acc={metrics['val_acc']:.3f}")
+        run_log["mode"]     = "simple_split"
+        run_log["val_loss"] = metrics["val_loss"]
+        run_log["val_acc"]  = metrics["val_acc"]
     else:
-        print("  Training (walk-forward CV) …")
+        print("  Training (walk-forward CV) ...")
         fold_metrics = trainer.fit_walk_forward(
             features, labels,
             train_bars=WF_TRAIN_BARS,
             val_bars=WF_VAL_BARS,
             step_bars=WF_STEP_BARS,
-            save_path=model_path,
         )
         if fold_metrics:
-            avg_acc = np.mean([f["val_acc"] for f in fold_metrics])
-            avg_loss = np.mean([f["val_loss"] for f in fold_metrics])
+            avg_acc  = float(np.mean([f["val_acc"]  for f in fold_metrics]))
+            avg_loss = float(np.mean([f["val_loss"] for f in fold_metrics]))
             print(f"\n  Avg val_acc={avg_acc:.3f}  avg_val_loss={avg_loss:.4f}")
             print(
                 "\n  NOTE: val_acc ~33% = random (3 classes). "
@@ -237,50 +267,70 @@ def main():
                 "  Large gap (train_acc >> val_acc) = overfitting.\n"
                 "  Consistent val_acc across folds = good generalisation."
             )
+            run_log["mode"]         = "walk_forward"
+            run_log["avg_val_acc"]  = round(avg_acc,  4)
+            run_log["avg_val_loss"] = round(avg_loss, 4)
+            run_log["folds"]        = fold_metrics
 
-    if not args.no_wf:
-        trainer.save(model_path)
+    # Always save the model regardless of training mode
+    trainer.save(model_path)
 
-    # ── 6. Backtest ───────────────────────────────────────────────────
-    print(f"\n  Running backtest with trained model ({interval}) …")
+    # 6. Hold-out backtest
+    print(f"\n  Running backtest with trained model ({interval}) ...")
     strategy = NNICTStrategy(
         model_path=model_path,
         seq_len=SEQ_LEN,
         min_confidence=0.50,
         contracts=1,
     )
-    test_bars = bars[int(n * 0.8):]       # hold-out last 20%
+    test_bars = bars[int(n * 0.8):]
     if len(test_bars) < SEQ_LEN + 50:
         print("  Insufficient hold-out bars for backtest.")
-        return
+    else:
+        feed = DataFeed(test_bars, warmup_bars=SEQ_LEN)
+        portfolio = Portfolio(
+            initial_cash=CASH,
+            margin_specs={SYMBOL: MarginSpec(SYMBOL, INIT_MARGIN, MAINT_MARGIN, MULTIPLIER)},
+            commission_per_contract=2.0,
+            slippage_ticks=1,
+            tick_size=TICK_SIZE,
+        )
+        result = BacktestEngine(feed, portfolio, [strategy], verbose=False).run()
+        a = result.analytics
 
-    feed = DataFeed(test_bars, warmup_bars=SEQ_LEN)
-    portfolio = Portfolio(
-        initial_cash=CASH,
-        margin_specs={SYMBOL: MarginSpec(SYMBOL, INIT_MARGIN, MAINT_MARGIN, MULTIPLIER)},
-        commission_per_contract=2.0,
-        slippage_ticks=1,
-        tick_size=TICK_SIZE,
-    )
-    result = BacktestEngine(feed, portfolio, [strategy], verbose=False).run()
-    a = result.analytics
+        print(f"\n  {'─'*50}")
+        print(f"  Hold-out backtest results (last 20% of bars)")
+        print(f"  {'─'*50}")
+        print(f"  Total return   : {a.total_return_pct:>+8.2f}%")
+        print(f"  Sharpe ratio   : {a.sharpe_ratio:>8.3f}")
+        print(f"  Max drawdown   : {a.max_drawdown_pct:>8.2f}%")
+        print(f"  Total trades   : {a.total_trades:>8}")
+        print(f"  Win rate       : {a.win_rate:>8.1f}%")
+        print(f"  {'─'*50}\n")
+        print(
+            "  Realistic expectations:\n"
+            "  - Sharpe > 0.5 on unseen data = viable edge\n"
+            "  - Sharpe > 1.0 = strong (rare for pure ML strategies)\n"
+            "  - Sharpe < 0.3 = no edge, needs more data / better features\n"
+            "  - Consistent across multiple hold-out periods = not overfit\n"
+        )
 
-    print(f"\n  {'─'*50}")
-    print(f"  Hold-out backtest results (last 20% of bars)")
-    print(f"  {'─'*50}")
-    print(f"  Total return   : {a.total_return_pct:>+8.2f}%")
-    print(f"  Sharpe ratio   : {a.sharpe_ratio:>8.3f}")
-    print(f"  Max drawdown   : {a.max_drawdown_pct:>8.2f}%")
-    print(f"  Total trades   : {a.total_trades:>8}")
-    print(f"  Win rate       : {a.win_rate:>8.1f}%")
-    print(f"  {'─'*50}\n")
-    print(
-        "  Realistic expectations:\n"
-        "  - Sharpe > 0.5 on unseen data = viable edge\n"
-        "  - Sharpe > 1.0 = strong (rare for pure ML strategies)\n"
-        "  - Sharpe < 0.3 = no edge, needs more data / better features\n"
-        "  - Consistent across multiple hold-out periods = not overfit\n"
-    )
+        # Add backtest results to the run log
+        run_log["backtest"] = {
+            "hold_out_pct":     20,
+            "n_test_bars":      len(test_bars),
+            "total_return_pct": round(a.total_return_pct, 4),
+            "sharpe_ratio":     round(a.sharpe_ratio,     4),
+            "max_drawdown_pct": round(a.max_drawdown_pct, 4),
+            "total_trades":     a.total_trades,
+            "win_rate":         round(a.win_rate,         4),
+        }
+
+    # 7. Save metrics JSON
+    with open(metrics_path, "w") as f:
+        json.dump(run_log, f, indent=2)
+    print(f"  Metrics saved  -> {metrics_path}")
+    print(f"  Model saved    -> {model_path}\n")
 
 
 if __name__ == "__main__":
