@@ -4,8 +4,10 @@ Futures Backtesting Example — NQ across multiple timeframes.
 Runs all four built-in strategies on each of:
     1m  · 5m  · 15m  · 1h  · 4h
 
-Real data is pulled from Yahoo Finance (NQ=F).
-A synthetic fallback is used if the download fails.
+Data loading strategy (in order of preference):
+  1. Local cache  — loaded instantly from data/<symbol>_<interval>.parquet
+  2. Yahoo Finance — downloaded, then saved to cache for next time
+  3. Synthetic     — used if both of the above fail
 
 Run with:
     python example.py
@@ -15,10 +17,12 @@ from __future__ import annotations
 
 import random
 from datetime import datetime, timedelta
+from pathlib import Path
 from typing import List
 
 from backtesting.data_feed import Bar, DataFeed
 from backtesting.engine import BacktestEngine
+from backtesting.loaders.cache import save_feed, load_feed_from_cache
 from backtesting.portfolio import Portfolio, MarginSpec
 from strategies.ema_crossover import EMACrossoverStrategy
 from strategies.rsi_mean_reversion import RSIMeanReversionStrategy
@@ -36,6 +40,9 @@ INIT_MARGIN  = 21_000.0
 MAINT_MARGIN = 19_000.0
 TICK_SIZE    = 0.25
 CASH         = 500_000.0
+
+# Cache directory — created automatically on first run
+CACHE_DIR = Path("data")
 
 # Timeframes to test.
 # period=None → DataFeed.from_yfinance auto-selects the maximum allowed period.
@@ -83,10 +90,25 @@ def make_synthetic_bars(n: int, interval: str) -> List[Bar]:
 # ---------------------------------------------------------------------------
 
 def load_feed(interval: str, period, warmup: int) -> DataFeed:
+    """Load bars from local cache if available, otherwise download and cache."""
+    cache_path = CACHE_DIR / f"{SYMBOL.replace('=', '')}_{interval}.parquet"
+
+    try:
+        return load_feed_from_cache(
+            cache_path,
+            symbol=SYMBOL,
+            contract_multiplier=MULTIPLIER,
+            warmup_bars=warmup,
+        )
+    except FileNotFoundError:
+        pass
+
     kwargs = {"interval": interval, "warmup_bars": warmup}
     if period:
         kwargs["period"] = period
-    return DataFeed.from_yfinance(SYMBOL, contract_multiplier=MULTIPLIER, **kwargs)
+    feed = DataFeed.from_yfinance(SYMBOL, contract_multiplier=MULTIPLIER, **kwargs)
+    save_feed(feed, cache_path)
+    return feed
 
 
 def make_strategies() -> list:
@@ -119,15 +141,17 @@ if __name__ == "__main__":
         print(f"  TIMEFRAME: {label}  ({interval})")
         print(f"{'='*60}")
 
-        # Download once; reuse bar list across all strategies
+        # Load from cache or download; reuse bar list across all strategies
+        cache_path = CACHE_DIR / f"{SYMBOL.replace('=', '')}_{interval}.parquet"
+        source = "cache" if cache_path.exists() else "Yahoo Finance"
         try:
-            print(f"  Downloading NQ=F {interval} data from Yahoo Finance...")
+            print(f"  Loading NQ=F {interval} data from {source}...")
             master_feed = load_feed(interval, period, warmup)
             bars = master_feed._bars
             print(f"  Loaded {len(bars)} bars.\n")
         except Exception as e:
             n = {"1m": 500, "5m": 400, "15m": 300, "1h": 200, "4h": 100}[interval]
-            print(f"  Download failed ({e}), using {n} synthetic bars.\n")
+            print(f"  Load failed ({e}), using {n} synthetic bars.\n")
             bars = make_synthetic_bars(n, interval)
 
         for strat in make_strategies():
