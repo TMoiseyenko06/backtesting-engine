@@ -1,0 +1,35 @@
+{
+  "interval": "5m",
+  "trained_at": "2026-03-12T21:31:39Z",
+  "model_path": "models/nn_ict_5m.pt",
+  "n_bars": 13207,
+  "n_features": 18,
+  "label_pct": {
+    "buy": 20.32,
+    "sell": 19.96,
+    "flat": 59.72
+  },
+  "hyperparams": {
+    "seq_len": 30,
+    "horizon": 12,
+    "threshold": 0.5,
+    "hidden_size": 64,
+    "epochs": 50,
+    "lr": 0.001,
+    "weight_decay": 0.05,
+    "batch_size": 64,
+    "patience": 10
+  },
+  "mode": "simple_split",
+  "val_loss": 1.0906,
+  "val_acc": 0.3751,
+  "backtest": {
+    "hold_out_pct": 20,
+    "n_test_bars": 2642,
+    "total_return_pct": 0.0,
+    "sharpe_ratio": 0.0,
+    "max_drawdown_pct": 0.0,
+    "total_trades": 0,
+    "win_rate": 0.0
+  }
+}
