@@ -284,23 +284,17 @@ def main():
         closes, highs, lows, atr, horizon=HORIZON, threshold=THRESHOLD
     )
 
-    # 3b. Drawdown feature — fraction of max drawdown consumed (0=none, 1=limit hit).
-    # Simulates how much of the $MAX_DRAWDOWN_USD would be used if MAX_CONTRACTS were
-    # held throughout.  Teaches the NN that trading when drawdown≥1 is always wrong.
+    # 3b. Drawdown feature — trailing drawdown from running price peak, expressed
+    # as a fraction of MAX_DRAWDOWN_USD (capped at 2.0 so extreme drops don't
+    # dominate).  The NN learns from real label outcomes in high-drawdown regimes;
+    # at inference the live equity value replaces this price proxy.
     peak_close  = np.maximum.accumulate(closes)
     dd_frac     = np.clip(
         (peak_close - closes) * MAX_CONTRACTS * MULTIPLIER / MAX_DRAWDOWN_USD,
         0.0, 2.0,
     ).astype(np.float32)
     features = np.column_stack([features, dd_frac])
-
-    # Force Flat label wherever simulated drawdown would have hit the limit
-    breached = dd_frac >= 1.0
-    n_breached = int(breached.sum())
-    if n_breached:
-        labels[breached] = 1  # Flat — never trade when limit is reached
-        print(f"  Drawdown feature: {n_breached:,} bars ({n_breached/n*100:.1f}%) "
-              f"relabelled Flat (drawdown limit reached)")
+    print(f"  Drawdown feature appended — median dd_frac={float(np.median(dd_frac)):.3f}")
 
     buy_pct  = float((labels == 2).mean() * 100)
     sell_pct = float((labels == 0).mean() * 100)
