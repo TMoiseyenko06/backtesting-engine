@@ -175,7 +175,7 @@ def _download_1m_chunked(ticker: str, days_back: int = 30) -> "pd.DataFrame":
                 chunks.append(df)
                 fetched += 1
         except Exception as exc:
-            print(f"    Warning: chunk {s}→{e} failed ({exc}), skipping.")
+            print(f"    Warning: chunk {s}->{e} failed ({exc}), skipping.")
         chunk_end = chunk_start
 
     if not chunks:
@@ -212,7 +212,7 @@ def load_bars(interval: str, refresh: bool = False) -> list[Bar]:
                                            contract_multiplier=MULTIPLIER)
             CACHE_DIR.mkdir(exist_ok=True)
             save_feed(feed, cache)
-            print(f"  Saved {feed._total:,} bars → {cache}")
+            print(f"  Saved {feed._total:,} bars -> {cache}")
             return feed._bars
         except Exception as e:
             print(f"  1m download failed ({e}). Using synthetic bars.")

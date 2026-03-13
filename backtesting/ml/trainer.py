@@ -219,7 +219,7 @@ class Trainer:
             )
             print(
                 f"  NOTE: val_acc ~33% = random (3 classes). Target >38-42% for edge.\n"
-                f"  gap = train_acc - val_acc.  >0.12 → overfitting; try reducing\n"
+                f"  gap = train_acc - val_acc.  >0.12 -> overfitting; try reducing\n"
                 f"  hidden_size / increasing dropout / weight_decay."
             )
 
@@ -258,7 +258,7 @@ class Trainer:
         path = Path(path)
         path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(self.model.state_dict(), path)
-        print(f"  Model saved → {path}")
+        print(f"  Model saved -> {path}")
 
     @classmethod
     def load_model(

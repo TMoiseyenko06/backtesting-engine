@@ -339,5 +339,5 @@ def _run_backtest(interval: str) -> dict:
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    print("Dashboard → http://localhost:8000")
+    print("Dashboard -> http://localhost:8000")
     uvicorn.run("dashboard:app", host="0.0.0.0", port=8000, reload=False)

@@ -157,7 +157,7 @@ def from_alpha_vantage(
     if not all_frames:
         raise ValueError(
             f"Alpha Vantage returned no data for {ticker} {interval} "
-            f"{start}→{end}. Check your API key and ticker."
+            f"{start}->{end}. Check your API key and ticker."
         )
 
     df = pd.concat(all_frames, ignore_index=True)

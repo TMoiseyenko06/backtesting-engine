@@ -151,7 +151,7 @@ def from_polygon(
     if not all_results:
         raise ValueError(
             f"Polygon returned no data for {ticker} "
-            f"{multiplier}/{timespan} {start}→{end}. "
+            f"{multiplier}/{timespan} {start}->{end}. "
             "Check your API key, ticker, and subscription tier."
         )
 
