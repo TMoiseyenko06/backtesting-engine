@@ -32,7 +32,7 @@ Saved files
   models/nn_ict_5m_metrics.json    -- per-fold metrics + config + backtest result
 
 Run:
-    python train_nn.py                        # 1m bars, walk-forward CV (downloads 1yr)
+    python train_nn.py                        # 1m bars, walk-forward CV (downloads 30d)
     python train_nn.py --interval 5m          # 5m bars (60-day yfinance limit)
     python train_nn.py --no-wf                # simple 80/20 split (faster)
     python train_nn.py --refresh              # force re-download even if cache exists
@@ -100,9 +100,8 @@ DROPOUT_FC   = 0.4
 BATCH_SIZE   = 64
 PATIENCE     = 10      # early stopping patience
 
-# Walk-forward params  (1m bars — ~1 trading week = ~2,400 bars)
-# Sized to allow ~5+ folds on a typical 5–10k bar download.
-# Increase WF_TRAIN_BARS if you have 20k+ bars.
+# Walk-forward params  (1m bars — yfinance gives ~30 days ≈ 29k bars)
+# ~10 folds on a 30-day download; increase WF_TRAIN_BARS if you have more data.
 WF_TRAIN_BARS = 2500   # initial training window (~1 week of 1m bars)
 WF_VAL_BARS   = 500    # validation window per fold
 WF_STEP_BARS  = 500    # advance per fold
@@ -141,10 +140,11 @@ def make_synthetic_bars(n: int, interval: str) -> list[Bar]:
 # Data loading
 # ---------------------------------------------------------------------------
 
-def _download_1m_chunked(ticker: str, days_back: int = 365) -> "pd.DataFrame":
+def _download_1m_chunked(ticker: str, days_back: int = 30) -> "pd.DataFrame":
     """
     Download 1m bars going back ``days_back`` calendar days by fetching
-    consecutive 7-day windows (yfinance hard limit for 1m data).
+    consecutive 7-day windows.  yfinance limits 1m data to the last 30
+    calendar days; chunks older than that are silently skipped.
 
     Returns a combined, deduplicated, chronologically sorted DataFrame.
     """
@@ -154,6 +154,8 @@ def _download_1m_chunked(ticker: str, days_back: int = 365) -> "pd.DataFrame":
     except ImportError:
         raise ImportError("yfinance not installed. Run: pip install yfinance")
 
+    # Cap at 30 days — Yahoo Finance hard limit for 1m data
+    days_back = min(days_back, 30)
     end   = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
     start = end - timedelta(days=days_back)
 
@@ -201,11 +203,11 @@ def load_bars(interval: str, refresh: bool = False) -> list[Bar]:
         except FileNotFoundError:
             pass
 
-    # 1m: stitch 7-day chunks to cover a full year
+    # 1m: stitch 7-day chunks up to the 30-day yfinance limit
     if interval == "1m":
         try:
-            print(f"  Downloading 1m bars (1 year, ~52 weekly chunks) ...")
-            df = _download_1m_chunked(SYMBOL, days_back=365)
+            print(f"  Downloading 1m bars (last 30 days, ~5 weekly chunks) ...")
+            df = _download_1m_chunked(SYMBOL, days_back=30)
             feed = DataFeed.from_dataframe(df, symbol=SYMBOL,
                                            contract_multiplier=MULTIPLIER)
             CACHE_DIR.mkdir(exist_ok=True)

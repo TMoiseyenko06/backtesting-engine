@@ -140,7 +140,7 @@ class DataFeed:
     # Maximum lookback period yfinance supports per intraday interval.
     # Exceeding these silently returns truncated or empty data.
     _YF_MAX_PERIOD: dict = {
-        "1m":  "7d",
+        "1m":  "30d",
         "2m":  "60d",
         "5m":  "60d",
         "15m": "60d",
@@ -191,7 +191,7 @@ class DataFeed:
         yfinance intraday limits
         ------------------------
         =======  ==========
-        1m       last 7 days
+        1m       last 30 days
         5m       last 60 days
         15m      last 60 days
         1h       last 730 days
