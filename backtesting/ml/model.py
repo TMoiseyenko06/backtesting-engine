@@ -107,6 +107,13 @@ class LSTMSignalModel(nn.Module):
             dropout=lstm_dropout if num_layers > 1 else 0.0,
         )
 
+        # Normalise the LSTM's final hidden state before the FC head.
+        # LayerNorm keeps activations on a consistent scale regardless of
+        # sequence length, which stabilises training and reduces the tendency
+        # for the top LSTM layer to produce extreme hidden-state values that
+        # the FC head memorises.
+        self.lstm_norm = nn.LayerNorm(hidden_size)
+
         # Shared trunk — both heads branch off here
         self.shared = nn.Sequential(
             nn.Dropout(fc_dropout),
@@ -138,7 +145,7 @@ class LSTMSignalModel(nn.Module):
         sl_tp   : Tensor (batch, 2)          — [sl_atr_mult, tp_atr_mult], always > 0
         """
         _, (h_n, _) = self.lstm(x)
-        last_hidden = h_n[-1]           # top layer's final hidden state
+        last_hidden = self.lstm_norm(h_n[-1])   # normalise before FC head
         shared = self.shared(last_hidden)
         logits = self.direction_head(shared)
         sl_tp  = self.sl_tp_head(shared) + SL_TP_MIN

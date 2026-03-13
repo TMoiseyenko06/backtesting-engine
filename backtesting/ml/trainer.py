@@ -177,22 +177,27 @@ class Trainer:
                 continue
 
             class_weights = self._class_weights(labels[train_idx])
-            val_loss, val_acc = self._train_fold(train_ds, val_ds, class_weights)
+            val_loss, val_acc, train_acc = self._train_fold(train_ds, val_ds, class_weights)
 
             elapsed = time.time() - t0
+            gap = train_acc - val_acc
             metrics = {
                 "fold":       fold_idx,
                 "train_size": len(train_ds),
                 "val_size":   len(val_ds),
+                "train_acc":  round(train_acc, 4),
                 "val_loss":   round(val_loss, 4),
                 "val_acc":    round(val_acc, 4),
+                "gap":        round(gap, 4),
                 "elapsed_s":  round(elapsed, 1),
             }
             fold_metrics.append(metrics)
+            gap_flag = "  ⚠ overfit" if gap > 0.12 else ""
             print(
                 f"  Fold {fold_idx:>2}  train={len(train_ds):>5}  val={len(val_ds):>5}"
-                f"  val_loss={val_loss:.4f}  val_acc={val_acc:.3f}"
-                f"  ({elapsed:.1f}s)"
+                f"  train_acc={train_acc:.3f}  val_acc={val_acc:.3f}"
+                f"  gap={gap:+.3f}  val_loss={val_loss:.4f}"
+                f"  ({elapsed:.1f}s){gap_flag}"
             )
 
             if val_acc > best_val_acc:
@@ -205,7 +210,18 @@ class Trainer:
 
         if last_state is not None:
             self.model.load_state_dict(last_state)
-            print(f"\n  Using last-fold model  (best fold val_acc = {best_val_acc:.3f})")
+            avg_gap = sum(m["gap"] for m in fold_metrics) / len(fold_metrics) if fold_metrics else 0.0
+            avg_val_acc = sum(m["val_acc"] for m in fold_metrics) / len(fold_metrics) if fold_metrics else 0.0
+            avg_val_loss = sum(m["val_loss"] for m in fold_metrics) / len(fold_metrics) if fold_metrics else 0.0
+            print(
+                f"\n  Avg val_acc={avg_val_acc:.3f}  avg_val_loss={avg_val_loss:.4f}"
+                f"  avg_gap={avg_gap:+.3f}  (best fold val_acc = {best_val_acc:.3f})"
+            )
+            print(
+                f"  NOTE: val_acc ~33% = random (3 classes). Target >38-42% for edge.\n"
+                f"  gap = train_acc - val_acc.  >0.12 → overfitting; try reducing\n"
+                f"  hidden_size / increasing dropout / weight_decay."
+            )
 
         if save_path:
             self.save(save_path)
@@ -232,8 +248,11 @@ class Trainer:
         val_ds   = SequenceDataset(features, labels, sl_tp_targets, self.seq_len, val_idx)
 
         class_weights = self._class_weights(labels[train_idx])
-        val_loss, val_acc = self._train_fold(train_ds, val_ds, class_weights)
-        return {"val_loss": round(val_loss, 4), "val_acc": round(val_acc, 4)}
+        val_loss, val_acc, train_acc = self._train_fold(train_ds, val_ds, class_weights)
+        gap = train_acc - val_acc
+        print(f"  train_acc={train_acc:.3f}  val_acc={val_acc:.3f}  gap={gap:+.3f}  val_loss={val_loss:.4f}")
+        return {"val_loss": round(val_loss, 4), "val_acc": round(val_acc, 4),
+                "train_acc": round(train_acc, 4), "gap": round(gap, 4)}
 
     def save(self, path: str | Path) -> None:
         path = Path(path)
@@ -265,7 +284,7 @@ class Trainer:
         train_ds: SequenceDataset,
         val_ds: SequenceDataset,
         class_weights: torch.Tensor,
-    ) -> tuple[float, float]:
+    ) -> tuple[float, float, float]:
         train_loader = DataLoader(
             train_ds, batch_size=self.batch_size, shuffle=True, drop_last=False
         )
@@ -273,8 +292,15 @@ class Trainer:
             val_ds, batch_size=self.batch_size, shuffle=False
         )
 
-        ce_criterion   = nn.CrossEntropyLoss(weight=class_weights.to(self.device))
-        mse_criterion  = nn.MSELoss(reduction="none")
+        w = class_weights.to(self.device)
+        # Smoothed criterion used only during the forward/backward pass.
+        # label_smoothing=0.1 prevents the model from becoming overconfident on
+        # wrong predictions, which is the primary driver of the high val_loss.
+        ce_train  = nn.CrossEntropyLoss(weight=w, label_smoothing=0.1)
+        # Unsmoothed criterion for evaluation so reported losses are comparable
+        # across runs and to the theoretical CE floor (~ln 3 ≈ 1.10 for random).
+        ce_eval   = nn.CrossEntropyLoss(weight=w)
+        mse_criterion = nn.MSELoss(reduction="none")
         optimiser = torch.optim.AdamW(
             self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
         )
@@ -294,7 +320,7 @@ class Trainer:
                 logits, sl_tp_pred = self.model(xb)
 
                 # Direction classification loss (all bars)
-                ce_loss = ce_criterion(logits, yb)
+                ce_loss = ce_train(logits, yb)
 
                 # SL/TP regression loss — only on Buy (2) and Sell (0) bars
                 trading_mask = (yb != 1)  # True for Buy and Sell bars
@@ -312,13 +338,15 @@ class Trainer:
                 optimiser.step()
             scheduler.step()
 
-            val_loss, val_acc = self._evaluate(val_loader, ce_criterion)
+            # Use unsmoothed CE for early stopping so the threshold is stable
+            val_loss, val_acc = self._evaluate(val_loader, ce_eval)
             if stopper.step(val_loss, self.model):
                 break
 
         stopper.restore_best(self.model)
-        val_loss, val_acc = self._evaluate(val_loader, ce_criterion)
-        return val_loss, val_acc
+        val_loss,   val_acc   = self._evaluate(val_loader,   ce_eval)
+        train_loss, train_acc = self._evaluate(train_loader, ce_eval)
+        return val_loss, val_acc, train_acc
 
     def _evaluate(
         self,

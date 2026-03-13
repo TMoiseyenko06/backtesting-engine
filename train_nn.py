@@ -91,10 +91,10 @@ MODEL_DIR  = Path("models")
 SEQ_LEN      = 60      # bars per LSTM input window  (60 min)
 HORIZON      = 30      # bars forward for label       (30 min)
 THRESHOLD    = 0.5     # ATR-normalised return needed to label Buy/Sell
-HIDDEN_SIZE  = 128     # 5-TF × 18 = 90 input features
+HIDDEN_SIZE  = 64      # ~90 input features; 128 was oversized → overfitting
 EPOCHS       = 50
 LR           = 1e-3
-WEIGHT_DECAY = 0.05
+WEIGHT_DECAY = 0.07    # bumped from 0.05 for extra L2 regularisation
 DROPOUT_LSTM = 0.3
 DROPOUT_FC   = 0.4
 BATCH_SIZE   = 64
