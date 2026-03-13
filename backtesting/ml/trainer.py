@@ -46,7 +46,20 @@ def select_device() -> str:
     if torch.backends.mps.is_available():
         print("  [device] Apple MPS detected.")
         return "mps"
-    print("  [device] No GPU detected, using CPU.")
+    # Distinguish between CPU-only PyTorch build and a missing/blocked driver
+    cuda_build = torch.__version__
+    if "+cu" in cuda_build or "+cuda" in cuda_build:
+        print(
+            f"  [device] GPU not accessible (PyTorch={cuda_build}). "
+            "Check that NVIDIA drivers are installed and the GPU is visible "
+            "(run: nvidia-smi). Falling back to CPU."
+        )
+    else:
+        print(
+            f"  [device] CPU-only PyTorch build detected ({cuda_build}). "
+            "For GPU support run: "
+            "pip install torch --index-url https://download.pytorch.org/whl/cu124"
+        )
     return "cpu"
 
 
