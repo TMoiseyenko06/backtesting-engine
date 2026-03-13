@@ -13,8 +13,13 @@ Multi-timeframe input
     1h  (18 feats) : last complete 1h candle  (12 × 5m)
     4h  (18 feats) : last complete 4h candle  (48 × 5m)
 
-  This gives the model context from micro structure (5m) all the way up to
-  the macro session trend (4h) without any lookahead.
+Prop firm risk rules (when prop_rules is provided)
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  • Max 4 contracts per position
+  • Max daily loss $1,500 — no new entries today once hit
+  • Max trailing drawdown $2,500 — halt trading permanently once hit
+  • RTH only — force-close all positions by 3:55 PM ET; no entries
+    outside 9:30 AM – 3:55 PM ET (no overnight holding)
 
 SL/TP — set by the neural network
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -41,6 +46,7 @@ from backtesting.strategy import Strategy
 from backtesting.ml.features import MultiTimeframeFeatureEngineer
 from backtesting.ml.model import LSTMSignalModel
 from backtesting.ml.trainer import select_device
+from strategies.prop_firm_risk import PropFirmRisk
 
 
 class NNICTStrategy(Strategy):
@@ -48,21 +54,25 @@ class NNICTStrategy(Strategy):
     Parameters
     ----------
     model_path : str | Path | None
-        Path to a saved model state dict (.pt file).  If None, a randomly
-        initialised model is used (useful for testing the pipeline).
+        Path to a saved model state dict (.pt file).  If None a randomly
+        initialised model is used (useful for pipeline testing).
     seq_len : int
         Number of bars to feed into the LSTM per inference.
     min_confidence : float
         Minimum softmax probability required to act on a signal (0–1).
     contracts : int
-        Number of contracts per trade.
+        Base number of contracts per trade (capped by prop_rules.max_contracts).
     device : str | None
         ``"cuda"``, ``"mps"``, ``"cpu"``, or ``None`` to auto-detect.
+    prop_rules : PropFirmRisk | None
+        If provided, enforces prop-firm session hours, daily loss limit,
+        max drawdown, and contract cap on every bar.  Pass ``None`` to
+        disable all rule enforcement (for research/debugging only).
     """
 
     name = "NN-ICT Strategy"
 
-    # 4h context needs ~10 complete 4h bars = 480 base bars + seq_len headroom
+    # 4h context needs ~10 complete 4h bars = 480 base bars + seq headroom
     _MIN_BUFFER = 600
 
     def __init__(
@@ -72,11 +82,13 @@ class NNICTStrategy(Strategy):
         min_confidence: float = 0.40,
         contracts: int = 1,
         device: str | None = None,
+        prop_rules: Optional[PropFirmRisk] = None,
     ) -> None:
         self.seq_len        = seq_len
         self.min_confidence = min_confidence
         self.contracts      = contracts
         self.device         = device if device is not None else select_device()
+        self.prop_rules     = prop_rules
 
         # Load model — auto-detects n_features from checkpoint weights
         if model_path and Path(model_path).exists():
@@ -96,8 +108,7 @@ class NNICTStrategy(Strategy):
         self._engineer = MultiTimeframeFeatureEngineer()
 
         # Buffer must hold enough history for 4h aggregation + seq window
-        buf_size = max(self._MIN_BUFFER, seq_len + self._MIN_BUFFER)
-        self._bar_buffer: deque[Bar] = deque(maxlen=buf_size)
+        self._bar_buffer: deque[Bar] = deque(maxlen=max(self._MIN_BUFFER, seq_len + self._MIN_BUFFER))
 
         # Active stop / TP levels (set by the NN at trade entry)
         self._stop_price: Optional[float] = None
@@ -110,54 +121,98 @@ class NNICTStrategy(Strategy):
     def on_bar(self, bar: Bar) -> None:
         self._bar_buffer.append(bar)
         bars: List[Bar] = list(self._bar_buffer)
+        sym = bar.symbol
 
-        # Need enough history for the 4h aggregation (48 bars per candle,
-        # ~10 complete candles for ICT lookbacks) plus the LSTM sequence window
+        # ── Prop firm: update risk state ────────────────────────────────
+        if self.prop_rules is not None:
+            self.prop_rules.update(bar.timestamp, self.equity())
+
+        # ── Force-close: outside session or prop firm halted ────────────
+        pos = self.position(sym)
+        if pos != 0:
+            if self._must_close(bar):
+                self.close_position(sym)
+                self._reset_levels()
+                return
+            # Manage running SL/TP
+            self._check_exit_levels(bar, sym, pos)
+            if self.position(sym) == 0:
+                return   # just hit SL or TP — wait for next bar
+
+        # ── Warmup: need enough history for 4h aggregation ──────────────
         if len(bars) < self._MIN_BUFFER:
             return
 
-        sym = bar.symbol
+        # ── Gate: prop firm rules block entry ───────────────────────────
+        if not self._can_enter(bar):
+            return
 
-        # --- Manage open stops / take profits ---
-        pos = self.position(sym)
-        if pos != 0:
-            self._check_exit_levels(bar, sym, pos)
-            if self.position(sym) == 0:
-                return   # just exited, wait for next bar
-
-        # --- Run inference (direction + SL/TP multiples) ---
+        # ── Run inference ────────────────────────────────────────────────
         signal, confidence, sl_mult, tp_mult = self._infer(bars)
 
-        # --- Act on signal ---
+        # ── Act on signal ────────────────────────────────────────────────
+        n_contracts = self._contracts_to_trade()
+
         if signal == 2 and confidence >= self.min_confidence:   # Buy
             if pos <= 0:
                 if pos < 0:
                     self.close_position(sym)
-                self._enter_long(bar, bars, sl_mult, tp_mult)
+                self._enter_long(bar, bars, sl_mult, tp_mult, n_contracts)
 
         elif signal == 0 and confidence >= self.min_confidence:  # Sell
             if pos >= 0:
                 if pos > 0:
                     self.close_position(sym)
-                self._enter_short(bar, bars, sl_mult, tp_mult)
+                self._enter_short(bar, bars, sl_mult, tp_mult, n_contracts)
 
         # signal == 1 (Flat): do nothing
+
+    # ------------------------------------------------------------------
+    # Prop firm helpers
+    # ------------------------------------------------------------------
+
+    def _must_close(self, bar: Bar) -> bool:
+        """Should we force-close because of session end or halt?"""
+        if self.prop_rules is None:
+            return False
+        if self.prop_rules.halted:
+            return True
+        return self.prop_rules.should_close(bar.timestamp)
+
+    def _can_enter(self, bar: Bar) -> bool:
+        """All prop firm checks must pass before a new entry is allowed."""
+        if self.prop_rules is None:
+            return True
+        # No new entries if halted
+        if self.prop_rules.halted:
+            return False
+        # Must be inside RTH session AND before entry cutoff
+        if not self.prop_rules.is_in_session(bar.timestamp):
+            return False
+        if self.prop_rules.should_close(bar.timestamp):
+            return False
+        # Loss limits
+        return self.prop_rules.can_enter(self.equity())
+
+    def _contracts_to_trade(self) -> int:
+        """Contracts for next trade, capped by prop firm limit."""
+        n = self.contracts
+        if self.prop_rules is not None:
+            n = min(n, self.prop_rules.max_contracts)
+        return max(1, n)
 
     # ------------------------------------------------------------------
     # Inference
     # ------------------------------------------------------------------
 
     def _infer(self, bars: List[Bar]) -> tuple[int, float, float, float]:
-        """
-        Returns (predicted_class, confidence, sl_atr_mult, tp_atr_mult).
-        Flat signal returns default multiples that are never used.
-        """
-        feat_matrix = self._engineer.transform(bars)       # (n_bars, n_feat)
-        seq = feat_matrix[-self.seq_len:]                   # last seq_len rows
+        """Returns (predicted_class, confidence, sl_atr_mult, tp_atr_mult)."""
+        feat_matrix = self._engineer.transform(bars)
+        seq = feat_matrix[-self.seq_len:]
         if len(seq) < self.seq_len:
-            return 1, 0.0, 1.5, 2.5   # Flat / not enough data
+            return 1, 0.0, 1.5, 2.5   # Flat / insufficient data
 
-        x = torch.from_numpy(seq).unsqueeze(0).to(self.device)  # (1, seq, feat)
+        x = torch.from_numpy(seq).unsqueeze(0).to(self.device)
         return self._model.predict_with_sl_tp(x)
 
     # ------------------------------------------------------------------
@@ -175,23 +230,25 @@ class NNICTStrategy(Strategy):
                 abs(recent[i].high - recent[i - 1].close),
                 abs(recent[i].low  - recent[i - 1].close),
             ))
-        return np.mean(trs) if trs else bars[-1].close * 0.001
+        return float(np.mean(trs)) if trs else bars[-1].close * 0.001
 
     def _enter_long(
-        self, bar: Bar, bars: List[Bar], sl_mult: float, tp_mult: float
+        self, bar: Bar, bars: List[Bar],
+        sl_mult: float, tp_mult: float, n_contracts: int,
     ) -> None:
         atr = self._atr_now(bars)
         self._stop_price = bar.close - sl_mult * atr
         self._tp_price   = bar.close + tp_mult * atr
-        self.buy(bar.symbol, self.contracts)
+        self.buy(bar.symbol, n_contracts)
 
     def _enter_short(
-        self, bar: Bar, bars: List[Bar], sl_mult: float, tp_mult: float
+        self, bar: Bar, bars: List[Bar],
+        sl_mult: float, tp_mult: float, n_contracts: int,
     ) -> None:
         atr = self._atr_now(bars)
         self._stop_price = bar.close + sl_mult * atr
         self._tp_price   = bar.close - tp_mult * atr
-        self.sell(bar.symbol, self.contracts)
+        self.sell(bar.symbol, n_contracts)
 
     def _check_exit_levels(self, bar: Bar, sym: str, pos: int) -> None:
         if self._stop_price is None or self._tp_price is None:

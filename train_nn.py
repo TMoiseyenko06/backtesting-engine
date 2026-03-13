@@ -58,6 +58,7 @@ from backtesting.ml.model import LSTMSignalModel
 from backtesting.ml.trainer import Trainer
 from backtesting.portfolio import Portfolio, MarginSpec
 from strategies.nn_ict_strategy import NNICTStrategy
+from strategies.prop_firm_risk import PropFirmRisk
 
 
 # ---------------------------------------------------------------------------
@@ -66,9 +67,17 @@ from strategies.nn_ict_strategy import NNICTStrategy
 
 SYMBOL     = "NQ=F"
 MULTIPLIER = 20.0
-CASH       = 500_000.0
-INIT_MARGIN  = 21_000.0
-MAINT_MARGIN = 19_000.0
+
+# Prop firm account settings
+CASH         = 50_000.0    # starting capital
+MAX_CONTRACTS = 4           # hard position cap (prop firm rule)
+MAX_DAILY_LOSS    = 1_500.0 # stop trading today if daily loss reaches this
+MAX_DRAWDOWN_USD  = 2_500.0 # halt account if trailing drawdown reaches this
+
+# Reduced margin to allow up to MAX_CONTRACTS on a $50k account
+# ($50k / 4 = $12,500 per contract available for initial margin)
+INIT_MARGIN  = 12_000.0
+MAINT_MARGIN = 10_000.0
 TICK_SIZE    = 0.25
 
 CACHE_DIR  = Path("data")
@@ -286,11 +295,18 @@ def main():
 
     # 6. Hold-out backtest
     print(f"\n  Running backtest with trained model ({interval}) ...")
+    prop_rules = PropFirmRisk(
+        max_contracts=MAX_CONTRACTS,
+        max_daily_loss_usd=MAX_DAILY_LOSS,
+        max_drawdown_usd=MAX_DRAWDOWN_USD,
+        initial_equity=CASH,
+    )
     strategy = NNICTStrategy(
         model_path=model_path,
         seq_len=SEQ_LEN,
         min_confidence=0.40,
-        contracts=1,
+        contracts=MAX_CONTRACTS,
+        prop_rules=prop_rules,
     )
     test_bars = bars[int(n * 0.8):]
     if len(test_bars) < SEQ_LEN + 50:
