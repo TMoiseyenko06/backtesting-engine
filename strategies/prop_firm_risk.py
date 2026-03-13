@@ -12,6 +12,11 @@ Implements the risk guardrails for a $50k NQ futures prop firm account:
           maintenance break from 5:00 PM – 6:00 PM ET (21:00–22:00 UTC).
           • All open positions force-closed by 4:55 PM ET (5 min buffer)
           • No new entries during the maintenance window (21:00–22:00 UTC)
+  Rule 5  Short-trade frequency — no more than 50% of completed trades may
+          have a duration shorter than 10 seconds (enforced once ≥5 trades).
+  Rule 6  Short-trade profit cap — trades lasting < 10 seconds may not
+          account for more than 50% of total gross profit (enforced once ≥5
+          trades with positive P&L exist).
 
 Times are expressed in UTC using EDT (UTC-4) as the baseline, which is
 accurate for ~Mar–Nov.  In EST months (Nov–Mar) this shifts by 1 hour.
@@ -55,6 +60,16 @@ class PropFirmRisk:
         (default $2,500).
     initial_equity : float
         Starting account equity (default $50,000).
+    short_trade_secs : float
+        Trades shorter than this many seconds are classified as
+        "short trades" for Rules 5 & 6 (default 10).
+    max_short_trade_pct : float
+        Maximum fraction of total trades that may be short trades,
+        enforced once ≥5 trades exist (default 0.50 = 50%).
+    max_short_profit_pct : float
+        Maximum fraction of total gross profit that short trades may
+        contribute, enforced once ≥5 profitable trades exist
+        (default 0.50 = 50%).
     """
 
     # NQ futures maintenance break: 5:00–6:00 PM ET = 21:00–22:00 UTC (EDT)
@@ -68,15 +83,46 @@ class PropFirmRisk:
         max_daily_loss_usd: float = 1_500.0,
         max_drawdown_usd: float   = 2_500.0,
         initial_equity: float     = 50_000.0,
+        short_trade_secs: float   = 10.0,
+        max_short_trade_pct: float  = 0.50,
+        max_short_profit_pct: float = 0.50,
     ) -> None:
-        self.max_contracts     = max_contracts
-        self.max_daily_loss    = max_daily_loss_usd
-        self.max_drawdown      = max_drawdown_usd
+        self.max_contracts      = max_contracts
+        self.max_daily_loss     = max_daily_loss_usd
+        self.max_drawdown       = max_drawdown_usd
+        self.short_trade_secs   = short_trade_secs
+        self.max_short_trade_pct  = max_short_trade_pct
+        self.max_short_profit_pct = max_short_profit_pct
 
-        self._peak_equity: float           = initial_equity
+        self._peak_equity: float               = initial_equity
         self._day_open_equity: Optional[float] = None
-        self._current_date: Optional[date] = None
-        self._halted: bool                 = False   # permanent halt on drawdown
+        self._current_date: Optional[date]     = None
+        self._halted: bool                     = False   # permanent halt on drawdown
+
+        # Trade history for Rules 5 & 6 — populated via record_trade()
+        self._trade_durations: list[float] = []   # seconds per completed trade
+        self._trade_pnls: list[float]      = []   # net P&L per completed trade
+
+    # ------------------------------------------------------------------
+    # Trade reporting — call after every completed round-trip
+    # ------------------------------------------------------------------
+
+    def record_trade(self, duration_secs: float, net_pnl: float) -> None:
+        """
+        Register a completed trade for Rules 5 & 6.
+
+        Call this once per closed trade (entry → exit).  The strategy is
+        responsible for calling it with the correct duration and net P&L.
+
+        Parameters
+        ----------
+        duration_secs : float
+            Elapsed seconds from entry fill to exit fill.
+        net_pnl : float
+            Realised net P&L of the trade (after commissions).
+        """
+        self._trade_durations.append(duration_secs)
+        self._trade_pnls.append(net_pnl)
 
     # ------------------------------------------------------------------
     # Must call once per bar before any entry/exit decisions
@@ -138,6 +184,26 @@ class PropFirmRisk:
             if self._day_open_equity - equity >= self.max_daily_loss:
                 return False
 
+        # Rules 5 & 6: short-trade frequency and profit limits
+        n = len(self._trade_durations)
+        if n >= 5:
+            short_mask = [d < self.short_trade_secs for d in self._trade_durations]
+            short_count = sum(short_mask)
+
+            # Rule 5: short trades must be < max_short_trade_pct of all trades
+            if short_count / n > self.max_short_trade_pct:
+                return False
+
+            # Rule 6: short-trade gross profit ≤ max_short_profit_pct of total profit
+            total_profit = sum(p for p in self._trade_pnls if p > 0)
+            if total_profit > 0:
+                short_profit = sum(
+                    p for is_short, p in zip(short_mask, self._trade_pnls)
+                    if is_short and p > 0
+                )
+                if short_profit / total_profit > self.max_short_profit_pct:
+                    return False
+
         return True
 
     # ------------------------------------------------------------------
@@ -160,9 +226,20 @@ class PropFirmRisk:
         """One-line status string for logging."""
         dd = self._peak_equity - equity
         daily = (self._day_open_equity - equity) if self._day_open_equity else 0.0
+        n = len(self._trade_durations)
+        short_count = sum(1 for d in self._trade_durations if d < self.short_trade_secs)
+        short_pct = short_count / n * 100 if n else 0.0
+        total_profit = sum(p for p in self._trade_pnls if p > 0)
+        short_profit = sum(
+            p for d, p in zip(self._trade_durations, self._trade_pnls)
+            if d < self.short_trade_secs and p > 0
+        )
+        short_profit_pct = short_profit / total_profit * 100 if total_profit > 0 else 0.0
         return (
             f"equity={equity:,.0f}  "
             f"drawdown={dd:,.0f}/{self.max_drawdown:,.0f}  "
-            f"daily_loss={daily:,.0f}/{self.max_daily_loss:,.0f}"
+            f"daily_loss={daily:,.0f}/{self.max_daily_loss:,.0f}  "
+            f"short_trades={short_count}/{n}({short_pct:.0f}%)  "
+            f"short_profit={short_profit_pct:.0f}%"
             + ("  [HALTED]" if self._halted else "")
         )

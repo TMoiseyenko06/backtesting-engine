@@ -114,6 +114,9 @@ class NNICTStrategy(Strategy):
         self._stop_price: Optional[float] = None
         self._tp_price:   Optional[float] = None
 
+        # Track how many trades have been reported to prop_rules (Rules 5 & 6)
+        self._reported_trade_count: int = 0
+
     # ------------------------------------------------------------------
     # Strategy interface
     # ------------------------------------------------------------------
@@ -123,9 +126,10 @@ class NNICTStrategy(Strategy):
         bars: List[Bar] = list(self._bar_buffer)
         sym = bar.symbol
 
-        # ── Prop firm: update risk state ────────────────────────────────
+        # ── Prop firm: update risk state & sync completed trades ────────
         if self.prop_rules is not None:
             self.prop_rules.update(bar.timestamp, self.equity())
+            self._sync_trades_to_prop_rules()
 
         # ── Force-close: outside session or prop firm halted ────────────
         pos = self.position(sym)
@@ -275,6 +279,19 @@ class NNICTStrategy(Strategy):
             if bar.high >= self._stop_price or bar.low <= self._tp_price:
                 self.close_position(sym)
                 self._reset_levels()
+
+    def _sync_trades_to_prop_rules(self) -> None:
+        """
+        Forward any newly completed trades from the portfolio to PropFirmRisk
+        so that Rules 5 & 6 (short-trade frequency and profit limits) are
+        evaluated with up-to-date data before the next entry decision.
+        """
+        all_trades = self._engine.portfolio.all_trades
+        while self._reported_trade_count < len(all_trades):
+            t = all_trades[self._reported_trade_count]
+            duration_secs = (t.exit_time - t.entry_time).total_seconds()
+            self.prop_rules.record_trade(duration_secs, t.net_pnl)
+            self._reported_trade_count += 1
 
     def _reset_levels(self) -> None:
         self._stop_price = None
