@@ -100,9 +100,11 @@ BATCH_SIZE   = 64
 PATIENCE     = 10      # early stopping patience
 
 # Walk-forward params  (1m bars — ~1 trading week = ~2,400 bars)
-WF_TRAIN_BARS = 5000   # initial training window (~2 weeks of 1m bars)
-WF_VAL_BARS   = 1000   # validation window per fold
-WF_STEP_BARS  = 1000   # advance per fold
+# Sized to allow ~5+ folds on a typical 5–10k bar download.
+# Increase WF_TRAIN_BARS if you have 20k+ bars.
+WF_TRAIN_BARS = 2500   # initial training window (~1 week of 1m bars)
+WF_VAL_BARS   = 500    # validation window per fold
+WF_STEP_BARS  = 500    # advance per fold
 
 
 # ---------------------------------------------------------------------------
@@ -311,11 +313,16 @@ def main():
         contracts=MAX_CONTRACTS,
         prop_rules=prop_rules,
     )
-    test_bars = bars[int(n * 0.8):]
-    if len(test_bars) < SEQ_LEN + 50:
+    split_idx = int(n * 0.8)
+    # Pre-seed the strategy's internal bar buffer: include the last
+    # _MIN_BUFFER bars from training so the warmup check clears immediately.
+    ctx_start = max(0, split_idx - NNICTStrategy._MIN_BUFFER)
+    test_bars  = bars[ctx_start:]
+    n_warmup   = (split_idx - ctx_start) + SEQ_LEN   # these bars don't count for PnL
+    if len(test_bars) - n_warmup < 50:
         print("  Insufficient hold-out bars for backtest.")
     else:
-        feed = DataFeed(test_bars, warmup_bars=SEQ_LEN)
+        feed = DataFeed(test_bars, warmup_bars=n_warmup)
         portfolio = Portfolio(
             initial_cash=CASH,
             margin_specs={SYMBOL: MarginSpec(SYMBOL, INIT_MARGIN, MAINT_MARGIN, MULTIPLIER)},
@@ -346,7 +353,7 @@ def main():
         # Add backtest results to the run log
         run_log["backtest"] = {
             "hold_out_pct":     20,
-            "n_test_bars":      len(test_bars),
+            "n_test_bars":      n - split_idx,
             "total_return_pct": round(a.total_return_pct, 4),
             "sharpe_ratio":     round(a.sharpe_ratio,     4),
             "max_drawdown_pct": round(a.max_drawdown_pct, 4),
