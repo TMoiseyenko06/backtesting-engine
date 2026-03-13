@@ -1,8 +1,9 @@
 """
 Dataset utilities
 -----------------
-SequenceDataset  : PyTorch Dataset that serves sliding windows of features
-                   and a 3-class label (Buy=2, Flat=1, Sell=0).
+SequenceDataset  : PyTorch Dataset that serves sliding windows of features,
+                   a 3-class direction label (Buy=2, Flat=1, Sell=0), and
+                   a 2-element SL/TP regression target [sl_atr_mult, tp_atr_mult].
 
 walk_forward_splits : generator that yields (train_idx, val_idx) index ranges
                       for proper time-series cross-validation.  This is the
@@ -11,8 +12,8 @@ walk_forward_splits : generator that yields (train_idx, val_idx) index ranges
 
 Label engineering
 ~~~~~~~~~~~~~~~~~
-The label for bar i is based on the *future* return over `horizon` bars,
-normalised by ATR to be volatility-adjusted:
+The direction label for bar i is based on the *future* return over `horizon`
+bars, normalised by ATR to be volatility-adjusted:
 
     z_ret = (close[i+horizon] - close[i]) / (ATR[i] * sqrt(horizon))
 
@@ -20,9 +21,22 @@ normalised by ATR to be volatility-adjusted:
     Sell (0) : z_ret < -threshold
     Flat (1) : otherwise
 
-Using an ATR-normalised threshold means the model only acts on moves that
-are large relative to current noise — realistic rather than chasing every
-tick.  The default threshold of 0.5 means roughly half an ATR per root-bar.
+SL/TP regression targets
+~~~~~~~~~~~~~~~~~~~~~~~~
+For each bar labeled Buy or Sell, the regression targets are the
+Max Adverse Excursion (MAE) and Max Favorable Excursion (MFE) over
+the next `horizon` bars, each normalised by ATR:
+
+    Buy  label at bar i:
+        sl_atr = (close[i] - min(lows[i+1 .. i+horizon])) / ATR[i]   ← downside MAE
+        tp_atr = (max(highs[i+1 .. i+horizon]) - close[i]) / ATR[i]  ← upside  MFE
+
+    Sell label at bar i:
+        sl_atr = (max(highs[i+1 .. i+horizon]) - close[i]) / ATR[i]  ← upside  MAE
+        tp_atr = (close[i] - min(lows[i+1 .. i+horizon])) / ATR[i]   ← downside MFE
+
+Both targets are clipped to [0.3, 6.0].  For Flat bars the values default to
+[1.5, 2.5] but are masked out of the regression loss during training.
 """
 
 from __future__ import annotations
@@ -32,6 +46,11 @@ from typing import Generator, Tuple, List
 import numpy as np
 import torch
 from torch.utils.data import Dataset
+
+# Fallback SL/TP for flat bars (never used in loss, but stored for completeness)
+_FLAT_SL = 1.5
+_FLAT_TP = 2.5
+_SL_TP_CLIP = (0.3, 6.0)
 
 
 class SequenceDataset(Dataset):
@@ -44,6 +63,8 @@ class SequenceDataset(Dataset):
         Pre-computed feature matrix from ICTFeatureEngineer.
     labels : np.ndarray, shape (n_bars,)
         Integer class labels {0, 1, 2}.
+    sl_tp_targets : np.ndarray, shape (n_bars, 2)
+        Regression targets [sl_atr_mult, tp_atr_mult] per bar.
     seq_len : int
         Number of bars per sequence fed to the LSTM (look-back window).
     indices : list[int] | None
@@ -55,73 +76,95 @@ class SequenceDataset(Dataset):
         self,
         features: np.ndarray,
         labels: np.ndarray,
+        sl_tp_targets: np.ndarray,
         seq_len: int,
         indices: List[int] | None = None,
     ) -> None:
-        self.features = features.astype(np.float32)
-        self.labels   = labels.astype(np.int64)
-        self.seq_len  = seq_len
+        self.features      = features.astype(np.float32)
+        self.labels        = labels.astype(np.int64)
+        self.sl_tp_targets = sl_tp_targets.astype(np.float32)
+        self.seq_len       = seq_len
 
         if indices is None:
-            # All valid end-of-window positions
             self._indices = list(range(seq_len - 1, len(features)))
         else:
-            # Only positions that have enough history
             self._indices = [i for i in indices if i >= seq_len - 1]
 
     def __len__(self) -> int:
         return len(self._indices)
 
-    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor]:
+    def __getitem__(self, idx: int) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         end   = self._indices[idx]
         start = end - self.seq_len + 1
-        x = torch.from_numpy(self.features[start: end + 1])   # (seq_len, n_feat)
-        y = torch.tensor(self.labels[end], dtype=torch.long)
-        return x, y
+        x      = torch.from_numpy(self.features[start: end + 1])        # (seq_len, n_feat)
+        y_cls  = torch.tensor(self.labels[end], dtype=torch.long)        # scalar
+        y_sltp = torch.from_numpy(self.sl_tp_targets[end])               # (2,)
+        return x, y_cls, y_sltp
 
 
 def make_labels(
     closes: np.ndarray,
+    highs: np.ndarray,
+    lows: np.ndarray,
     atr: np.ndarray,
     horizon: int = 12,
     threshold: float = 0.5,
-) -> np.ndarray:
+) -> tuple[np.ndarray, np.ndarray]:
     """
-    Build 3-class labels without lookahead leakage in the *model* — labels
-    are only used during *training* (not at inference time).
+    Build 3-class direction labels and SL/TP regression targets without
+    lookahead leakage in the *model* — labels are only used during *training*.
 
     Parameters
     ----------
-    closes : np.ndarray, shape (n,)
+    closes, highs, lows : np.ndarray, shape (n,)
     atr : np.ndarray, shape (n,)
         ATR values (NaN for early bars).
     horizon : int
-        How many bars forward to measure the return.
+        How many bars forward to measure the return / excursion.
     threshold : float
         Minimum ATR-normalised return to trigger Buy/Sell.
 
     Returns
     -------
-    np.ndarray of int8, shape (n,)
-        0=Sell, 1=Flat, 2=Buy.  Last `horizon` bars are labelled Flat
-        since no future return is available.
+    labels : np.ndarray of int8, shape (n,)
+        0=Sell, 1=Flat, 2=Buy.  Last `horizon` bars are labelled Flat.
+    sl_tp_targets : np.ndarray of float32, shape (n, 2)
+        [sl_atr_mult, tp_atr_mult] per bar (MAE/MFE normalised by ATR).
     """
     n = len(closes)
-    labels = np.ones(n, dtype=np.int8)   # default Flat
+    labels        = np.ones(n, dtype=np.int8)
+    sl_tp_targets = np.full((n, 2), [_FLAT_SL, _FLAT_TP], dtype=np.float32)
 
     for i in range(n - horizon):
         a = atr[i]
         if np.isnan(a) or a == 0:
             continue
+
         future_ret = (closes[i + horizon] - closes[i]) / closes[i]
         z = future_ret / (a / closes[i] * np.sqrt(horizon))
-        if z > threshold:
-            labels[i] = 2   # Buy
-        elif z < -threshold:
-            labels[i] = 0   # Sell
-        # else stays 1 (Flat)
 
-    return labels
+        future_highs = highs[i + 1: i + horizon + 1]
+        future_lows  = lows[i + 1:  i + horizon + 1]
+
+        if z > threshold:
+            labels[i] = 2  # Buy
+            # MAE = how far down it went (adverse for long)
+            # MFE = how far up it went (favorable for long)
+            sl_atr = (closes[i] - float(future_lows.min())) / a
+            tp_atr = (float(future_highs.max()) - closes[i]) / a
+        elif z < -threshold:
+            labels[i] = 0  # Sell
+            # MAE = how far up it went (adverse for short)
+            # MFE = how far down it went (favorable for short)
+            sl_atr = (float(future_highs.max()) - closes[i]) / a
+            tp_atr = (closes[i] - float(future_lows.min())) / a
+        else:
+            continue  # Flat — keep defaults
+
+        sl_tp_targets[i, 0] = np.clip(sl_atr, *_SL_TP_CLIP)
+        sl_tp_targets[i, 1] = np.clip(tp_atr, *_SL_TP_CLIP)
+
+    return labels, sl_tp_targets
 
 
 def walk_forward_splits(

@@ -105,31 +105,46 @@ class TestICTFeatureEngineer:
 
 class TestMakeLabels:
 
+    def _make_arrays(self, n, start=100, end=110):
+        closes = np.linspace(start, end, n)
+        highs  = closes + 0.5
+        lows   = closes - 0.5
+        return closes, highs, lows
+
     def test_output_shape(self):
-        closes = np.linspace(100, 110, 200)
+        closes, highs, lows = self._make_arrays(200)
         atr    = np.full(200, 1.0)
-        labels = make_labels(closes, atr, horizon=10)
+        labels, sl_tp = make_labels(closes, highs, lows, atr, horizon=10)
         assert labels.shape == (200,)
+        assert sl_tp.shape  == (200, 2)
 
     def test_labels_are_0_1_2(self):
-        closes = np.linspace(100, 110, 200)
+        closes, highs, lows = self._make_arrays(200)
         atr    = np.full(200, 0.5)
-        labels = make_labels(closes, atr, horizon=5)
+        labels, _ = make_labels(closes, highs, lows, atr, horizon=5)
         assert set(labels.tolist()).issubset({0, 1, 2})
 
     def test_last_horizon_bars_are_flat(self):
-        closes = np.linspace(100, 200, 100)
+        closes, highs, lows = self._make_arrays(100, 100, 200)
         atr    = np.full(100, 1.0)
-        labels = make_labels(closes, atr, horizon=10)
+        labels, _ = make_labels(closes, highs, lows, atr, horizon=10)
         assert (labels[-10:] == 1).all()
 
     def test_trending_up_produces_buy_labels(self):
         # Strong uptrend → most labels should be Buy
         closes = np.linspace(100, 300, 300)   # large, clean trend
+        highs  = closes + 0.5
+        lows   = closes - 0.5
         atr    = np.full(300, 0.1)            # tiny ATR → z large
-        labels = make_labels(closes, atr, horizon=10, threshold=0.5)
+        labels, _ = make_labels(closes, highs, lows, atr, horizon=10, threshold=0.5)
         buy_pct = (labels == 2).mean()
         assert buy_pct > 0.5, f"Expected mostly Buy labels in uptrend, got {buy_pct:.2f}"
+
+    def test_sl_tp_targets_positive(self):
+        closes, highs, lows = self._make_arrays(200, 100, 300)
+        atr    = np.full(200, 1.0)
+        _, sl_tp = make_labels(closes, highs, lows, atr, horizon=10)
+        assert (sl_tp > 0).all(), "All SL/TP targets must be positive"
 
 
 # ---------------------------------------------------------------------------
@@ -138,26 +153,33 @@ class TestMakeLabels:
 
 class TestSequenceDataset:
 
+    def _make_sl_tp(self, n):
+        return np.full((n, 2), [1.5, 2.5], dtype=np.float32)
+
     def test_length(self):
         features = np.random.rand(200, N_FEATURES).astype(np.float32)
         labels   = np.ones(200, dtype=np.int8)
-        ds       = SequenceDataset(features, labels, seq_len=20)
+        sl_tp    = self._make_sl_tp(200)
+        ds       = SequenceDataset(features, labels, sl_tp, seq_len=20)
         # valid positions: seq_len-1 .. 199  → 200 - 20 + 1 = 181
         assert len(ds) == 181
 
     def test_item_shapes(self):
         features = np.random.rand(100, N_FEATURES).astype(np.float32)
         labels   = np.zeros(100, dtype=np.int8)
-        ds       = SequenceDataset(features, labels, seq_len=15)
-        x, y = ds[0]
-        assert x.shape == (15, N_FEATURES)
-        assert y.shape == ()
+        sl_tp    = self._make_sl_tp(100)
+        ds       = SequenceDataset(features, labels, sl_tp, seq_len=15)
+        x, y, y_sltp = ds[0]
+        assert x.shape    == (15, N_FEATURES)
+        assert y.shape    == ()
+        assert y_sltp.shape == (2,)
 
     def test_custom_indices(self):
         features = np.random.rand(200, N_FEATURES).astype(np.float32)
         labels   = np.ones(200, dtype=np.int8)
+        sl_tp    = self._make_sl_tp(200)
         indices  = list(range(100, 150))
-        ds       = SequenceDataset(features, labels, seq_len=10, indices=indices)
+        ds       = SequenceDataset(features, labels, sl_tp, seq_len=10, indices=indices)
         assert len(ds) == len([i for i in indices if i >= 9])
 
 
@@ -197,8 +219,19 @@ class TestLSTMSignalModel:
     def test_forward_shape(self):
         model = LSTMSignalModel()
         x = torch.randn(4, 30, N_FEATURES)
-        out = model(x)
-        assert out.shape == (4, 3)
+        logits, sl_tp = model(x)
+        assert logits.shape == (4, 3)
+        assert sl_tp.shape  == (4, 2)
+        assert (sl_tp > 0).all()
+
+    def test_predict_with_sl_tp(self):
+        model = LSTMSignalModel()
+        x = torch.randn(1, 30, N_FEATURES)
+        cls, conf, sl, tp = model.predict_with_sl_tp(x)
+        assert cls in (0, 1, 2)
+        assert 0.0 <= conf <= 1.0
+        assert sl > 0
+        assert tp > 0
 
     def test_predict_proba_sums_to_one(self):
         model = LSTMSignalModel()
@@ -246,24 +279,27 @@ class TestTrainer:
         highs    = np.array([b.high  for b in bars])
         lows     = np.array([b.low   for b in bars])
         atr      = ICTFeatureEngineer._atr(highs, lows, closes, 14)
-        labels   = make_labels(closes, atr, horizon=5, threshold=0.5)
-        return features, labels
+        labels, sl_tp_targets = make_labels(closes, highs, lows, atr,
+                                            horizon=5, threshold=0.5)
+        return features, labels, sl_tp_targets
 
     def test_fit_simple_runs(self):
-        features, labels = self._make_data(300)
+        features, labels, sl_tp = self._make_data(300)
         model   = LSTMSignalModel()
-        trainer = Trainer(model, seq_len=20, batch_size=32, epochs=2, patience=2)
-        result  = trainer.fit(features, labels, val_split=0.2)
+        trainer = Trainer(model, seq_len=20, batch_size=32, epochs=2, patience=2,
+                          device="cpu")
+        result  = trainer.fit(features, labels, sl_tp, val_split=0.2)
         assert "val_loss" in result
         assert "val_acc"  in result
         assert 0.0 <= result["val_acc"] <= 1.0
 
     def test_walk_forward_runs(self):
-        features, labels = self._make_data(500)
+        features, labels, sl_tp = self._make_data(500)
         model   = LSTMSignalModel()
-        trainer = Trainer(model, seq_len=20, batch_size=32, epochs=2, patience=2)
+        trainer = Trainer(model, seq_len=20, batch_size=32, epochs=2, patience=2,
+                          device="cpu")
         metrics = trainer.fit_walk_forward(
-            features, labels,
+            features, labels, sl_tp,
             train_bars=200, val_bars=100, step_bars=100,
         )
         assert len(metrics) >= 1
@@ -271,17 +307,18 @@ class TestTrainer:
             assert 0.0 <= m["val_acc"] <= 1.0
 
     def test_trainer_save_load(self):
-        features, labels = self._make_data(300)
+        features, labels, sl_tp = self._make_data(300)
         model   = LSTMSignalModel()
-        trainer = Trainer(model, seq_len=20, batch_size=32, epochs=2, patience=2)
-        trainer.fit(features, labels)
+        trainer = Trainer(model, seq_len=20, batch_size=32, epochs=2, patience=2,
+                          device="cpu")
+        trainer.fit(features, labels, sl_tp)
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "model.pt"
             trainer.save(path)
             assert path.exists()
             loaded = LSTMSignalModel()
-            Trainer.load_model(path, loaded)
+            Trainer.load_model(path, loaded, device="cpu")
 
 
 # ---------------------------------------------------------------------------

@@ -3,10 +3,13 @@ Trainer
 -------
 Handles:
   * Class-weighted CrossEntropyLoss  (combats the flat-heavy label imbalance)
+  * MSE regression loss on SL/TP targets (only on Buy/Sell bars)
+  * Multi-task total loss = CE + sl_tp_weight * MSE
   * AdamW optimiser with L2 weight decay  (another overfitting guard)
   * Early stopping on validation loss
   * Walk-forward cross-validation via walk_forward_splits()
   * Saving / loading best model weights
+  * Automatic device selection (CUDA → MPS → CPU)
 
 Walk-forward CV is the MOST important protection against overfitting for
 financial time series.  The model trains on older data and validates on the
@@ -29,6 +32,22 @@ from torch.utils.data import DataLoader
 
 from backtesting.ml.dataset import SequenceDataset, walk_forward_splits
 from backtesting.ml.model import LSTMSignalModel
+
+
+def select_device() -> str:
+    """
+    Auto-select the best available compute device:
+      CUDA (NVIDIA GPU) → MPS (Apple Silicon) → CPU
+    """
+    if torch.cuda.is_available():
+        name = torch.cuda.get_device_name(0)
+        print(f"  [device] CUDA GPU detected: {name}")
+        return "cuda"
+    if torch.backends.mps.is_available():
+        print("  [device] Apple MPS detected.")
+        return "mps"
+    print("  [device] No GPU detected, using CPU.")
+    return "cpu"
 
 
 class EarlyStopping:
@@ -72,8 +91,11 @@ class Trainer:
         L2 penalty (AdamW).  0.01–0.1 is typical.
     patience : int
         Early stopping patience (epochs).
-    device : str
-        ``"cpu"`` or ``"cuda"``.
+    device : str | None
+        ``"cuda"``, ``"mps"``, ``"cpu"``, or ``None`` to auto-detect.
+    sl_tp_weight : float
+        Weight of the SL/TP regression loss relative to direction CE loss.
+        Loss = CE + sl_tp_weight * MSE(sl_tp on trading bars only).
     """
 
     def __init__(
@@ -85,16 +107,18 @@ class Trainer:
         lr: float = 1e-3,
         weight_decay: float = 0.05,
         patience: int = 10,
-        device: str = "cpu",
+        device: str | None = None,
+        sl_tp_weight: float = 0.5,
     ) -> None:
-        self.model       = model.to(device)
+        self.device      = device if device is not None else select_device()
+        self.model       = model.to(self.device)
         self.seq_len     = seq_len
         self.batch_size  = batch_size
         self.epochs      = epochs
         self.lr          = lr
         self.weight_decay = weight_decay
         self.patience    = patience
-        self.device      = device
+        self.sl_tp_weight = sl_tp_weight
 
     # ------------------------------------------------------------------
     # Public API
@@ -104,6 +128,7 @@ class Trainer:
         self,
         features: np.ndarray,
         labels: np.ndarray,
+        sl_tp_targets: np.ndarray,
         train_bars: int,
         val_bars: int,
         step_bars: int,
@@ -131,8 +156,8 @@ class Trainer:
 
         for fold_idx, (train_idx, val_idx) in enumerate(folds):
             t0 = time.time()
-            train_ds = SequenceDataset(features, labels, self.seq_len, train_idx)
-            val_ds   = SequenceDataset(features, labels, self.seq_len, val_idx)
+            train_ds = SequenceDataset(features, labels, sl_tp_targets, self.seq_len, train_idx)
+            val_ds   = SequenceDataset(features, labels, sl_tp_targets, self.seq_len, val_idx)
 
             if len(train_ds) == 0 or len(val_ds) == 0:
                 print(f"  Fold {fold_idx}: insufficient data, skipping.")
@@ -174,6 +199,7 @@ class Trainer:
         self,
         features: np.ndarray,
         labels: np.ndarray,
+        sl_tp_targets: np.ndarray,
         val_split: float = 0.2,
     ) -> dict:
         """
@@ -185,8 +211,8 @@ class Trainer:
         train_idx = list(range(split))
         val_idx   = list(range(split, n))
 
-        train_ds = SequenceDataset(features, labels, self.seq_len, train_idx)
-        val_ds   = SequenceDataset(features, labels, self.seq_len, val_idx)
+        train_ds = SequenceDataset(features, labels, sl_tp_targets, self.seq_len, train_idx)
+        val_ds   = SequenceDataset(features, labels, sl_tp_targets, self.seq_len, val_idx)
 
         class_weights = self._class_weights(labels[train_idx])
         val_loss, val_acc = self._train_fold(train_ds, val_ds, class_weights)
@@ -203,8 +229,10 @@ class Trainer:
         cls,
         path: str | Path,
         model: LSTMSignalModel,
-        device: str = "cpu",
+        device: str | None = None,
     ) -> LSTMSignalModel:
+        if device is None:
+            device = select_device()
         state = torch.load(path, map_location=device, weights_only=True)
         model.load_state_dict(state)
         model.to(device)
@@ -228,7 +256,8 @@ class Trainer:
             val_ds, batch_size=self.batch_size, shuffle=False
         )
 
-        criterion = nn.CrossEntropyLoss(weight=class_weights.to(self.device))
+        ce_criterion   = nn.CrossEntropyLoss(weight=class_weights.to(self.device))
+        mse_criterion  = nn.MSELoss(reduction="none")
         optimiser = torch.optim.AdamW(
             self.model.parameters(), lr=self.lr, weight_decay=self.weight_decay
         )
@@ -239,36 +268,53 @@ class Trainer:
 
         for epoch in range(self.epochs):
             self.model.train()
-            for xb, yb in train_loader:
-                xb, yb = xb.to(self.device), yb.to(self.device)
+            for xb, yb, sltp_b in train_loader:
+                xb     = xb.to(self.device)
+                yb     = yb.to(self.device)
+                sltp_b = sltp_b.to(self.device)
+
                 optimiser.zero_grad()
-                loss = criterion(self.model(xb), yb)
+                logits, sl_tp_pred = self.model(xb)
+
+                # Direction classification loss (all bars)
+                ce_loss = ce_criterion(logits, yb)
+
+                # SL/TP regression loss — only on Buy (2) and Sell (0) bars
+                trading_mask = (yb != 1)  # True for Buy and Sell bars
+                if trading_mask.any():
+                    mse_raw  = mse_criterion(sl_tp_pred[trading_mask],
+                                             sltp_b[trading_mask])
+                    mse_loss = mse_raw.mean()
+                else:
+                    mse_loss = torch.tensor(0.0, device=self.device)
+
+                loss = ce_loss + self.sl_tp_weight * mse_loss
                 loss.backward()
                 # Gradient clipping prevents exploding gradients in LSTM
                 nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
                 optimiser.step()
             scheduler.step()
 
-            val_loss, val_acc = self._evaluate(val_loader, criterion)
+            val_loss, val_acc = self._evaluate(val_loader, ce_criterion)
             if stopper.step(val_loss, self.model):
                 break
 
         stopper.restore_best(self.model)
-        val_loss, val_acc = self._evaluate(val_loader, criterion)
+        val_loss, val_acc = self._evaluate(val_loader, ce_criterion)
         return val_loss, val_acc
 
     def _evaluate(
         self,
         loader: DataLoader,
-        criterion: nn.Module,
+        ce_criterion: nn.Module,
     ) -> tuple[float, float]:
         self.model.eval()
         total_loss, correct, total = 0.0, 0, 0
         with torch.no_grad():
-            for xb, yb in loader:
+            for xb, yb, _sltp in loader:
                 xb, yb = xb.to(self.device), yb.to(self.device)
-                logits = self.model(xb)
-                total_loss += criterion(logits, yb).item() * len(yb)
+                logits, _ = self.model(xb)
+                total_loss += ce_criterion(logits, yb).item() * len(yb)
                 correct    += (logits.argmax(1) == yb).sum().item()
                 total      += len(yb)
         return (total_loss / total), (correct / total)

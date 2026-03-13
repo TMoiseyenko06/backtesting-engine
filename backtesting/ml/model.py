@@ -11,7 +11,8 @@ Architecture
               └─ Dropout(0.4)
                    └─ Linear(64, 32)  → ReLU
                         └─ Dropout(0.3)
-                             └─ Linear(32, 3)   → logits (Buy/Flat/Sell)
+                             ├─ Linear(32, 3)      → direction logits (Buy/Flat/Sell)
+                             └─ Linear(32, 2) + Softplus → sl_atr_mult, tp_atr_mult
 
 Design decisions to reduce overfitting
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
@@ -21,6 +22,14 @@ Design decisions to reduce overfitting
 - L2 weight decay applied by the optimiser (set in Trainer)
 - Class weights passed to CrossEntropyLoss so the flat-heavy label
   distribution doesn't cause the model to just always predict Flat
+
+Multi-task outputs
+~~~~~~~~~~~~~~~~~~
+- direction_head : 3-class logits (Sell=0, Flat=1, Buy=2)
+- sl_tp_head     : 2 positive scalars [sl_atr_mult, tp_atr_mult]
+                   representing how many ATRs away to place SL and TP.
+                   Trained via MSE on max-adverse / max-favorable excursion
+                   over the label horizon (only on Buy/Sell bars).
 """
 
 from __future__ import annotations
@@ -28,6 +37,10 @@ from __future__ import annotations
 import torch
 import torch.nn as nn
 from backtesting.ml.features import N_FEATURES
+
+# Safety bounds for predicted SL/TP ATR multiples
+SL_TP_MIN = 0.3
+SL_TP_MAX = 6.0
 
 
 class LSTMSignalModel(nn.Module):
@@ -69,15 +82,26 @@ class LSTMSignalModel(nn.Module):
             dropout=lstm_dropout if num_layers > 1 else 0.0,
         )
 
-        self.head = nn.Sequential(
+        # Shared trunk — both heads branch off here
+        self.shared = nn.Sequential(
             nn.Dropout(fc_dropout),
             nn.Linear(hidden_size, 32),
             nn.ReLU(),
             nn.Dropout(fc_dropout * 0.75),
-            nn.Linear(32, n_classes),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+        # Head 1: direction classification (Buy / Flat / Sell)
+        self.direction_head = nn.Linear(32, n_classes)
+
+        # Head 2: SL/TP regression — outputs sl_atr_mult and tp_atr_mult.
+        # Softplus ensures positive outputs; we add SL_TP_MIN so the floor
+        # is never zero.
+        self.sl_tp_head = nn.Sequential(
+            nn.Linear(32, 2),
+            nn.Softplus(),
+        )
+
+    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         """
         Parameters
         ----------
@@ -85,19 +109,21 @@ class LSTMSignalModel(nn.Module):
 
         Returns
         -------
-        Tensor of shape (batch, n_classes)  — raw logits
+        logits  : Tensor (batch, n_classes)  — raw direction logits
+        sl_tp   : Tensor (batch, 2)          — [sl_atr_mult, tp_atr_mult], always > 0
         """
-        # out: (batch, seq_len, hidden)
-        # h_n: (num_layers, batch, hidden)
         _, (h_n, _) = self.lstm(x)
         last_hidden = h_n[-1]           # top layer's final hidden state
-        return self.head(last_hidden)
+        shared = self.shared(last_hidden)
+        logits = self.direction_head(shared)
+        sl_tp  = self.sl_tp_head(shared) + SL_TP_MIN
+        return logits, sl_tp
 
     def predict_proba(self, x: torch.Tensor) -> torch.Tensor:
-        """Return softmax probabilities (no grad)."""
+        """Return softmax direction probabilities (no grad)."""
         self.eval()
         with torch.no_grad():
-            logits = self.forward(x)
+            logits, _ = self.forward(x)
         return torch.softmax(logits, dim=-1)
 
     def predict(self, x: torch.Tensor) -> int:
@@ -107,6 +133,26 @@ class LSTMSignalModel(nn.Module):
         """
         probs = self.predict_proba(x)
         return int(probs.argmax(dim=-1).item())
+
+    def predict_with_sl_tp(
+        self, x: torch.Tensor
+    ) -> tuple[int, float, float, float]:
+        """
+        Run a single forward pass and return direction + SL/TP multipliers.
+
+        Returns
+        -------
+        (predicted_class, confidence, sl_atr_mult, tp_atr_mult)
+        """
+        self.eval()
+        with torch.no_grad():
+            logits, sl_tp = self.forward(x)
+        probs       = torch.softmax(logits, dim=-1)[0]
+        predicted   = int(probs.argmax().item())
+        confidence  = float(probs[predicted].item())
+        sl_mult     = float(sl_tp[0, 0].clamp(SL_TP_MIN, SL_TP_MAX).item())
+        tp_mult     = float(sl_tp[0, 1].clamp(SL_TP_MIN, SL_TP_MAX).item())
+        return predicted, confidence, sl_mult, tp_mult
 
     @property
     def n_parameters(self) -> int:

@@ -52,6 +52,7 @@ from backtesting.data_feed import Bar, DataFeed
 from backtesting.engine import BacktestEngine
 from backtesting.loaders.cache import save_feed, load_feed_from_cache
 from backtesting.ml.dataset import make_labels
+from backtesting.ml.trainer import select_device
 from backtesting.ml.features import ICTFeatureEngineer
 from backtesting.ml.model import LSTMSignalModel
 from backtesting.ml.trainer import Trainer
@@ -157,7 +158,10 @@ def main():
                         choices=["1m", "5m", "15m", "1h"])
     parser.add_argument("--no-wf", action="store_true",
                         help="Use simple 80/20 split instead of walk-forward CV")
-    parser.add_argument("--device", default="cpu")
+    parser.add_argument(
+        "--device", default=None,
+        help="Compute device: 'cuda', 'mps', 'cpu', or omit to auto-detect."
+    )
     args = parser.parse_args()
 
     interval = args.interval
@@ -185,12 +189,14 @@ def main():
     features = engineer.transform(bars)
     print(f"  Feature matrix: {features.shape}  ({features.shape[1]} features)")
 
-    # 3. Labels
+    # 3. Labels + SL/TP regression targets
     closes = np.array([b.close for b in bars])
     highs  = np.array([b.high  for b in bars])
     lows   = np.array([b.low   for b in bars])
     atr    = ICTFeatureEngineer._atr(highs, lows, closes, 14)
-    labels = make_labels(closes, atr, horizon=HORIZON, threshold=THRESHOLD)
+    labels, sl_tp_targets = make_labels(
+        closes, highs, lows, atr, horizon=HORIZON, threshold=THRESHOLD
+    )
 
     buy_pct  = float((labels == 2).mean() * 100)
     sell_pct = float((labels == 0).mean() * 100)
@@ -206,6 +212,7 @@ def main():
     )
     print(f"  Model parameters: {model.n_parameters:,}")
 
+    device = args.device  # None → auto-detect inside Trainer
     trainer = Trainer(
         model=model,
         seq_len=SEQ_LEN,
@@ -214,7 +221,7 @@ def main():
         lr=LR,
         weight_decay=WEIGHT_DECAY,
         patience=PATIENCE,
-        device=args.device,
+        device=device,
     )
 
     # Build the run log that will be saved to JSON
@@ -244,7 +251,7 @@ def main():
     print()
     if args.no_wf:
         print("  Training (simple 80/20 split) ...")
-        metrics = trainer.fit(features, labels, val_split=0.2)
+        metrics = trainer.fit(features, labels, sl_tp_targets, val_split=0.2)
         print(f"  val_loss={metrics['val_loss']:.4f}  val_acc={metrics['val_acc']:.3f}")
         run_log["mode"]     = "simple_split"
         run_log["val_loss"] = metrics["val_loss"]
@@ -252,7 +259,7 @@ def main():
     else:
         print("  Training (walk-forward CV) ...")
         fold_metrics = trainer.fit_walk_forward(
-            features, labels,
+            features, labels, sl_tp_targets,
             train_bars=WF_TRAIN_BARS,
             val_bars=WF_VAL_BARS,
             step_bars=WF_STEP_BARS,

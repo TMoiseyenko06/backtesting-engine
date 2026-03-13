@@ -1,7 +1,8 @@
 """
 NNICTStrategy — Neural Network ICT Trading Strategy
 -----------------------------------------------------
-Uses the trained LSTMSignalModel to generate Buy/Sell/Flat signals.
+Uses the trained LSTMSignalModel to generate Buy/Sell/Flat signals and to
+set per-trade stop loss and take profit levels.
 
 Signal mapping
 ~~~~~~~~~~~~~~
@@ -9,12 +10,23 @@ Signal mapping
   Model output 0 (Sell) → enter short  (or exit long)
   Model output 1 (Flat) → do nothing   (or optionally exit)
 
-Position management
-~~~~~~~~~~~~~~~~~~~
-  - Max 1 contract long or short at a time
-  - ATR-based stop loss (1.5× ATR from entry)
-  - ATR-based take profit (2.5× ATR from entry)  — 1:1.67 R:R
-  - Exit on opposing signal
+SL/TP — set by the neural network
+~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
+  On every trade entry the model's regression head predicts two ATR multiples:
+    sl_atr_mult  — how far to place the stop loss from entry
+    tp_atr_mult  — how far to place the take profit from entry
+
+  For a LONG entry at price P with current ATR A:
+    stop_price = P - sl_atr_mult × A
+    tp_price   = P + tp_atr_mult × A
+
+  For a SHORT entry:
+    stop_price = P + sl_atr_mult × A
+    tp_price   = P - tp_atr_mult × A
+
+  The multiples are trained via MSE regression on the Max Adverse Excursion
+  (MAE) and Max Favorable Excursion (MFE) of the labelled Buy/Sell bars, so
+  the model learns context-sensitive levels rather than a fixed multiplier.
 
 Confidence filter
 ~~~~~~~~~~~~~~~~~
@@ -36,7 +48,7 @@ from backtesting.data_feed import Bar
 from backtesting.strategy import Strategy
 from backtesting.ml.features import ICTFeatureEngineer, N_FEATURES
 from backtesting.ml.model import LSTMSignalModel
-from backtesting.ml.trainer import Trainer
+from backtesting.ml.trainer import Trainer, select_device
 
 
 class NNICTStrategy(Strategy):
@@ -52,12 +64,8 @@ class NNICTStrategy(Strategy):
         Minimum softmax probability required to act on a signal (0–1).
     contracts : int
         Number of contracts per trade.
-    atr_stop_mult : float
-        Stop loss = entry_price ± atr_stop_mult × ATR.
-    atr_tp_mult : float
-        Take profit = entry_price ± atr_tp_mult × ATR.
-    device : str
-        ``"cpu"`` or ``"cuda"``.
+    device : str | None
+        ``"cuda"``, ``"mps"``, ``"cpu"``, or ``None`` to auto-detect.
     """
 
     name = "NN-ICT Strategy"
@@ -68,28 +76,31 @@ class NNICTStrategy(Strategy):
         seq_len: int = 30,
         min_confidence: float = 0.50,
         contracts: int = 1,
-        atr_stop_mult: float = 1.5,
-        atr_tp_mult: float = 2.5,
-        device: str = "cpu",
+        device: str | None = None,
     ) -> None:
         self.seq_len        = seq_len
         self.min_confidence = min_confidence
         self.contracts      = contracts
-        self.atr_stop_mult  = atr_stop_mult
-        self.atr_tp_mult    = atr_tp_mult
-        self.device         = device
+        self.device         = device if device is not None else select_device()
 
         self._model = LSTMSignalModel()
         if model_path and Path(model_path).exists():
-            Trainer.load_model(model_path, self._model, device)
+            try:
+                Trainer.load_model(model_path, self._model, self.device)
+            except Exception as e:
+                print(
+                    f"  [NNICTStrategy] Warning: could not load model weights "
+                    f"from {model_path} ({e}). Using random initialisation. "
+                    f"Re-run train_nn.py to generate a compatible checkpoint."
+                )
+        self._model.to(self.device)
 
         self._engineer = ICTFeatureEngineer()
 
         # Rolling buffer of raw Bar objects for feature computation
-        # We keep seq_len + headroom bars to compute ATR etc.
         self._bar_buffer: deque[Bar] = deque(maxlen=seq_len + 100)
 
-        # Active stop / TP levels
+        # Active stop / TP levels (set by the NN at trade entry)
         self._stop_price: Optional[float] = None
         self._tp_price:   Optional[float] = None
 
@@ -114,21 +125,21 @@ class NNICTStrategy(Strategy):
             if self.position(sym) == 0:
                 return   # just exited, wait for next bar
 
-        # --- Run inference ---
-        signal, confidence = self._infer(bars)
+        # --- Run inference (direction + SL/TP multiples) ---
+        signal, confidence, sl_mult, tp_mult = self._infer(bars)
 
         # --- Act on signal ---
         if signal == 2 and confidence >= self.min_confidence:   # Buy
             if pos <= 0:
                 if pos < 0:
                     self.close_position(sym)
-                self._enter_long(bar)
+                self._enter_long(bar, bars, sl_mult, tp_mult)
 
         elif signal == 0 and confidence >= self.min_confidence:  # Sell
             if pos >= 0:
                 if pos > 0:
                     self.close_position(sym)
-                self._enter_short(bar)
+                self._enter_short(bar, bars, sl_mult, tp_mult)
 
         # signal == 1 (Flat): do nothing
 
@@ -136,20 +147,18 @@ class NNICTStrategy(Strategy):
     # Inference
     # ------------------------------------------------------------------
 
-    def _infer(self, bars: List[Bar]):
+    def _infer(self, bars: List[Bar]) -> tuple[int, float, float, float]:
         """
-        Returns (predicted_class, confidence) where class ∈ {0, 1, 2}.
+        Returns (predicted_class, confidence, sl_atr_mult, tp_atr_mult).
+        Flat signal returns default multiples that are never used.
         """
         feat_matrix = self._engineer.transform(bars)       # (n_bars, n_feat)
         seq = feat_matrix[-self.seq_len:]                   # last seq_len rows
         if len(seq) < self.seq_len:
-            return 1, 0.0   # Flat / not enough data
+            return 1, 0.0, 1.5, 2.5   # Flat / not enough data
 
         x = torch.from_numpy(seq).unsqueeze(0).to(self.device)  # (1, seq, feat)
-        probs = self._model.predict_proba(x)[0]                 # (3,)
-        predicted = int(probs.argmax().item())
-        confidence = float(probs[predicted].item())
-        return predicted, confidence
+        return self._model.predict_with_sl_tp(x)
 
     # ------------------------------------------------------------------
     # Order helpers
@@ -168,16 +177,20 @@ class NNICTStrategy(Strategy):
             ))
         return np.mean(trs) if trs else bars[-1].close * 0.001
 
-    def _enter_long(self, bar: Bar) -> None:
-        atr = self._atr_now(list(self._bar_buffer))
-        self._stop_price = bar.close - self.atr_stop_mult * atr
-        self._tp_price   = bar.close + self.atr_tp_mult   * atr
+    def _enter_long(
+        self, bar: Bar, bars: List[Bar], sl_mult: float, tp_mult: float
+    ) -> None:
+        atr = self._atr_now(bars)
+        self._stop_price = bar.close - sl_mult * atr
+        self._tp_price   = bar.close + tp_mult * atr
         self.buy(bar.symbol, self.contracts)
 
-    def _enter_short(self, bar: Bar) -> None:
-        atr = self._atr_now(list(self._bar_buffer))
-        self._stop_price = bar.close + self.atr_stop_mult * atr
-        self._tp_price   = bar.close - self.atr_tp_mult   * atr
+    def _enter_short(
+        self, bar: Bar, bars: List[Bar], sl_mult: float, tp_mult: float
+    ) -> None:
+        atr = self._atr_now(bars)
+        self._stop_price = bar.close + sl_mult * atr
+        self._tp_price   = bar.close - tp_mult * atr
         self.sell(bar.symbol, self.contracts)
 
     def _check_exit_levels(self, bar: Bar, sym: str, pos: int) -> None:
