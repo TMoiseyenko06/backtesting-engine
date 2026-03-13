@@ -248,6 +248,10 @@ def main():
         "--device", default=None,
         help="Compute device: 'cuda', 'mps', 'cpu', or omit to auto-detect."
     )
+    parser.add_argument(
+        "--epochs", type=int, default=EPOCHS,
+        help=f"Max training epochs per fold (default: {EPOCHS})"
+    )
     args = parser.parse_args()
 
     interval = args.interval
@@ -316,7 +320,7 @@ def main():
         model=model,
         seq_len=SEQ_LEN,
         batch_size=BATCH_SIZE,
-        epochs=EPOCHS,
+        epochs=args.epochs,
         lr=LR,
         weight_decay=WEIGHT_DECAY,
         patience=PATIENCE,

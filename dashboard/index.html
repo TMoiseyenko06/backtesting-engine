@@ -1,0 +1,771 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>NQ Futures ML Dashboard</title>
+<script src="https://unpkg.com/lightweight-charts@4.1.7/dist/lightweight-charts.standalone.production.js"></script>
+<style>
+  /* ── Reset & base ────────────────────────────────────────────────── */
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+  :root {
+    --bg:        #0d0d1a;
+    --surface:   #13132b;
+    --surface2:  #1a1a3a;
+    --border:    #2a2a50;
+    --accent:    #7c6fff;
+    --accent2:   #5b52d8;
+    --green:     #00c896;
+    --red:       #ff4d6d;
+    --yellow:    #ffc947;
+    --text:      #dde1f0;
+    --muted:     #6b7099;
+    --font:      'Segoe UI', system-ui, sans-serif;
+    --mono:      'Cascadia Code', 'Fira Code', 'Consolas', monospace;
+    --radius:    10px;
+  }
+  html, body { height: 100%; }
+  body {
+    font-family: var(--font);
+    background: var(--bg);
+    color: var(--text);
+    font-size: 14px;
+    line-height: 1.5;
+    overflow-x: hidden;
+  }
+
+  /* ── Layout ──────────────────────────────────────────────────────── */
+  header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    padding: 14px 28px;
+    background: var(--surface);
+    border-bottom: 1px solid var(--border);
+    position: sticky; top: 0; z-index: 50;
+  }
+  header h1 { font-size: 17px; font-weight: 700; letter-spacing: .5px; }
+  header h1 span { color: var(--accent); }
+  #status-badge {
+    display: flex; align-items: center; gap: 8px;
+    font-size: 12px; color: var(--muted);
+  }
+  #status-dot {
+    width: 9px; height: 9px; border-radius: 50%;
+    background: var(--muted);
+    transition: background .3s;
+  }
+  #status-dot.training { background: var(--yellow); box-shadow: 0 0 6px var(--yellow); animation: pulse 1.2s infinite; }
+  #status-dot.ok  { background: var(--green); }
+  #status-dot.err { background: var(--red); }
+  @keyframes pulse { 0%,100%{ opacity:1; } 50%{ opacity:.4; } }
+
+  /* tabs */
+  nav { display: flex; gap: 4px; padding: 16px 28px 0; }
+  .tab-btn {
+    padding: 9px 22px; border-radius: var(--radius) var(--radius) 0 0;
+    border: 1px solid transparent; border-bottom: none;
+    background: transparent; color: var(--muted);
+    cursor: pointer; font-size: 13px; font-weight: 600;
+    transition: all .2s;
+  }
+  .tab-btn.active {
+    background: var(--surface); border-color: var(--border);
+    color: var(--accent);
+  }
+  .tab-btn:hover:not(.active) { color: var(--text); }
+
+  .tab-content { display: none; }
+  .tab-content.active { display: block; }
+
+  main { padding: 0 28px 40px; }
+
+  /* panels */
+  .panel {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 0 var(--radius) var(--radius) var(--radius);
+    padding: 24px;
+  }
+  .panel-row { display: flex; gap: 20px; }
+  .panel-col { display: flex; flex-direction: column; gap: 16px; }
+
+  /* ── Form controls ───────────────────────────────────────────────── */
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  label { font-size: 12px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .6px; }
+  select, input[type=number] {
+    background: var(--surface2); border: 1px solid var(--border);
+    color: var(--text); border-radius: 7px; padding: 9px 12px;
+    font-size: 13px; width: 100%;
+    appearance: none; -webkit-appearance: none;
+  }
+  select:focus, input[type=number]:focus { outline: none; border-color: var(--accent); }
+
+  .toggle-row { display: flex; align-items: center; gap: 10px; }
+  .toggle {
+    width: 38px; height: 21px; border-radius: 12px;
+    background: var(--border); border: none; cursor: pointer;
+    position: relative; transition: background .2s; flex-shrink: 0;
+  }
+  .toggle::after {
+    content: ''; position: absolute; top: 3px; left: 3px;
+    width: 15px; height: 15px; border-radius: 50%;
+    background: #fff; transition: transform .2s;
+  }
+  .toggle.on { background: var(--accent); }
+  .toggle.on::after { transform: translateX(17px); }
+
+  /* buttons */
+  .btn {
+    padding: 10px 20px; border-radius: 8px; border: none;
+    font-size: 13px; font-weight: 600; cursor: pointer; transition: all .15s;
+    display: inline-flex; align-items: center; gap: 7px;
+  }
+  .btn-primary { background: var(--accent); color: #fff; }
+  .btn-primary:hover { background: var(--accent2); }
+  .btn-primary:disabled { background: var(--border); color: var(--muted); cursor: not-allowed; }
+  .btn-danger { background: #3a1020; color: var(--red); border: 1px solid #5a1830; }
+  .btn-danger:hover { background: #4a1530; }
+  .btn-danger:disabled { opacity: .4; cursor: not-allowed; }
+  .btn-secondary { background: var(--surface2); color: var(--text); border: 1px solid var(--border); }
+  .btn-secondary:hover { border-color: var(--accent); }
+
+  /* ── Terminal log ────────────────────────────────────────────────── */
+  #log-wrap {
+    flex: 1;
+    background: #070712;
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    display: flex; flex-direction: column; overflow: hidden;
+    min-height: 460px;
+  }
+  #log-header {
+    padding: 10px 14px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    background: #0a0a1f;
+  }
+  #log-header span { font-size: 12px; color: var(--muted); font-family: var(--mono); }
+  #log {
+    flex: 1; overflow-y: auto; padding: 14px;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.7;
+    color: #b8c0d8;
+  }
+  #log::-webkit-scrollbar { width: 6px; }
+  #log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+  .log-line { white-space: pre-wrap; word-break: break-all; }
+  .log-line.fold    { color: #7c6fff; }
+  .log-line.done    { color: var(--green); font-weight: 600; }
+  .log-line.err     { color: var(--red); }
+  .log-line.section { color: #ffc947; }
+
+  /* progress bar */
+  #fold-progress-wrap { padding: 0 14px 12px; background: #0a0a1f; }
+  #fold-bar-bg { height: 4px; background: var(--surface2); border-radius: 2px; }
+  #fold-bar    { height: 4px; background: var(--accent); border-radius: 2px; width: 0; transition: width .4s; }
+
+  /* ── Stats cards ─────────────────────────────────────────────────── */
+  .stats-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+    gap: 12px; margin-bottom: 20px;
+  }
+  .stat-card {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: var(--radius); padding: 16px 18px;
+  }
+  .stat-label { font-size: 11px; color: var(--muted); font-weight: 600; text-transform: uppercase; letter-spacing: .5px; margin-bottom: 6px; }
+  .stat-value { font-size: 22px; font-weight: 700; }
+  .stat-value.pos { color: var(--green); }
+  .stat-value.neg { color: var(--red); }
+  .stat-value.neu { color: var(--text); }
+
+  /* ── Charts ──────────────────────────────────────────────────────── */
+  .chart-wrap {
+    background: #070712; border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden; margin-bottom: 20px;
+  }
+  .chart-header {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    background: #0a0a1f;
+  }
+  .chart-header h3 { font-size: 13px; font-weight: 600; }
+  .chart-legend { display: flex; gap: 14px; font-size: 11px; color: var(--muted); }
+  .legend-item { display: flex; align-items: center; gap: 5px; }
+  .legend-dot { width: 8px; height: 8px; border-radius: 50%; }
+  #candle-chart { width: 100%; height: 420px; }
+  #equity-chart { width: 100%; height: 200px; }
+
+  /* ── Trade table ─────────────────────────────────────────────────── */
+  .table-wrap {
+    background: var(--surface2); border: 1px solid var(--border);
+    border-radius: var(--radius); overflow: hidden;
+  }
+  .table-header {
+    padding: 12px 16px; border-bottom: 1px solid var(--border);
+    display: flex; align-items: center; justify-content: space-between;
+    background: #0a0a1f;
+  }
+  .table-header h3 { font-size: 13px; font-weight: 600; }
+  table { width: 100%; border-collapse: collapse; }
+  th {
+    padding: 10px 14px; text-align: left; font-size: 11px;
+    font-weight: 700; color: var(--muted); text-transform: uppercase;
+    letter-spacing: .5px; border-bottom: 1px solid var(--border);
+    background: #0c0c22;
+  }
+  td { padding: 10px 14px; font-size: 12.5px; border-bottom: 1px solid #1a1a35; }
+  tr:last-child td { border-bottom: none; }
+  tr:hover td { background: #16163a; }
+  .tag {
+    display: inline-block; padding: 2px 8px; border-radius: 4px;
+    font-size: 11px; font-weight: 700; letter-spacing: .4px;
+  }
+  .tag-long  { background: #003d28; color: var(--green); }
+  .tag-short { background: #3d0015; color: var(--red); }
+  .pnl-pos { color: var(--green); font-weight: 600; }
+  .pnl-neg { color: var(--red);   font-weight: 600; }
+
+  /* ── Backtest config bar ─────────────────────────────────────────── */
+  .bt-config {
+    display: flex; align-items: flex-end; gap: 14px;
+    margin-bottom: 20px; flex-wrap: wrap;
+  }
+  .bt-config .field { min-width: 130px; }
+
+  /* ── Misc ────────────────────────────────────────────────────────── */
+  .notice {
+    padding: 14px 18px; border-radius: var(--radius);
+    background: #1a1a35; border: 1px solid var(--border);
+    color: var(--muted); font-size: 13px; text-align: center;
+  }
+  .section-title {
+    font-size: 11px; font-weight: 700; color: var(--muted);
+    text-transform: uppercase; letter-spacing: .7px; margin-bottom: 10px;
+  }
+  hr { border: none; border-top: 1px solid var(--border); margin: 20px 0; }
+</style>
+</head>
+<body>
+
+<!-- ── Header ──────────────────────────────────────────────────────── -->
+<header>
+  <h1>NQ Futures <span>ML Dashboard</span></h1>
+  <div id="status-badge">
+    <div id="status-dot"></div>
+    <span id="status-text">Checking…</span>
+  </div>
+</header>
+
+<!-- ── Tabs ────────────────────────────────────────────────────────── -->
+<nav>
+  <button class="tab-btn active" onclick="switchTab('training')">⚡ Training</button>
+  <button class="tab-btn"        onclick="switchTab('backtest')">📈 Backtest</button>
+</nav>
+
+<main>
+
+<!-- ════════════════════════════════════════════════════════════════════
+     TRAINING TAB
+════════════════════════════════════════════════════════════════════ -->
+<div id="tab-training" class="tab-content active">
+<div class="panel">
+  <div class="panel-row">
+
+    <!-- Config column -->
+    <div class="panel-col" style="width:230px;flex-shrink:0">
+      <p class="section-title">Configuration</p>
+
+      <div class="field">
+        <label>Interval</label>
+        <select id="tr-interval">
+          <option value="1m">1 minute</option>
+          <option value="5m" selected>5 minutes</option>
+          <option value="15m">15 minutes</option>
+          <option value="1h">1 hour</option>
+        </select>
+      </div>
+
+      <div class="field">
+        <label>Max Epochs per Fold</label>
+        <input id="tr-epochs" type="number" min="1" max="500" value="50" />
+      </div>
+
+      <div class="field">
+        <label>Walk-Forward CV</label>
+        <div class="toggle-row">
+          <button id="tr-wf-toggle" class="toggle on" onclick="toggleWF()"></button>
+          <span id="tr-wf-label" style="font-size:13px">Enabled</span>
+        </div>
+      </div>
+
+      <div class="field">
+        <label>Refresh Data</label>
+        <div class="toggle-row">
+          <button id="tr-refresh-toggle" class="toggle" onclick="toggleRefresh()"></button>
+          <span id="tr-refresh-label" style="font-size:13px">Use cache</span>
+        </div>
+      </div>
+
+      <hr/>
+
+      <button id="btn-start" class="btn btn-primary" onclick="startTraining()">
+        ▶ Start Training
+      </button>
+      <button id="btn-stop" class="btn btn-danger" onclick="stopTraining()" disabled>
+        ◼ Stop
+      </button>
+    </div>
+
+    <!-- Log column -->
+    <div style="flex:1;display:flex;flex-direction:column;gap:10px">
+      <p class="section-title">Live Training Log</p>
+      <div id="log-wrap">
+        <div id="log-header">
+          <span id="log-status">idle</span>
+          <button class="btn btn-secondary" style="padding:4px 12px;font-size:11px" onclick="clearLog()">Clear</button>
+        </div>
+        <div id="fold-progress-wrap">
+          <div id="fold-bar-bg"><div id="fold-bar"></div></div>
+        </div>
+        <div id="log"></div>
+      </div>
+    </div>
+
+  </div><!-- panel-row -->
+</div><!-- panel -->
+</div><!-- tab-training -->
+
+
+<!-- ════════════════════════════════════════════════════════════════════
+     BACKTEST TAB
+════════════════════════════════════════════════════════════════════ -->
+<div id="tab-backtest" class="tab-content">
+<div class="panel">
+
+  <!-- Config + run -->
+  <div class="bt-config">
+    <div class="field">
+      <label>Interval</label>
+      <select id="bt-interval">
+        <option value="1m">1 minute</option>
+        <option value="5m" selected>5 minutes</option>
+        <option value="15m">15 minutes</option>
+        <option value="1h">1 hour</option>
+      </select>
+    </div>
+    <button id="btn-bt-run" class="btn btn-primary" onclick="runBacktest()">
+      ▶ Run Backtest
+    </button>
+    <span id="bt-running-msg" style="display:none;color:var(--yellow);font-size:13px;align-self:center">
+      ⏳ Running backtest…
+    </span>
+  </div>
+
+  <!-- Stats cards -->
+  <div class="stats-grid" id="stats-grid">
+    <div class="notice" style="grid-column:1/-1">
+      Run a backtest to see results.
+    </div>
+  </div>
+
+  <!-- Candlestick chart -->
+  <div class="chart-wrap">
+    <div class="chart-header">
+      <h3>Price Chart &amp; Trades</h3>
+      <div class="chart-legend">
+        <div class="legend-item"><div class="legend-dot" style="background:var(--green)"></div> Long entry</div>
+        <div class="legend-item"><div class="legend-dot" style="background:var(--red)"></div> Short entry</div>
+        <div class="legend-item"><div class="legend-dot" style="background:#aaa"></div> Exit</div>
+      </div>
+    </div>
+    <div id="candle-chart"></div>
+  </div>
+
+  <!-- Equity curve -->
+  <div class="chart-wrap">
+    <div class="chart-header">
+      <h3>Equity Curve</h3>
+    </div>
+    <div id="equity-chart"></div>
+  </div>
+
+  <!-- Trade table -->
+  <div class="table-wrap">
+    <div class="table-header">
+      <h3>Trade Log</h3>
+      <span id="trade-count" style="font-size:12px;color:var(--muted)">—</span>
+    </div>
+    <div style="overflow-x:auto">
+      <table>
+        <thead>
+          <tr>
+            <th>#</th>
+            <th>Side</th>
+            <th>Entry Time</th>
+            <th>Entry Price</th>
+            <th>Exit Time</th>
+            <th>Exit Price</th>
+            <th>Qty</th>
+            <th>Duration</th>
+            <th>Net P&amp;L</th>
+          </tr>
+        </thead>
+        <tbody id="trade-tbody">
+          <tr><td colspan="9" style="text-align:center;color:var(--muted);padding:20px">No trades yet.</td></tr>
+        </tbody>
+      </table>
+    </div>
+  </div>
+
+</div><!-- panel -->
+</div><!-- tab-backtest -->
+
+</main><!-- /main -->
+
+<script>
+/* ════════════════════════════════════════════════════════════════════
+   State & helpers
+════════════════════════════════════════════════════════════════════ */
+let ws         = null;
+let wfEnabled  = true;
+let refreshEnabled = false;
+let foldsSeen  = 0;
+let totalFolds = 0;
+let candleChart = null;
+let equityChart = null;
+let candleSeries = null;
+let equitySeries = null;
+
+function $(id) { return document.getElementById(id); }
+
+function switchTab(name) {
+  document.querySelectorAll('.tab-content').forEach(el => el.classList.remove('active'));
+  document.querySelectorAll('.tab-btn').forEach(el => el.classList.remove('active'));
+  $('tab-' + name).classList.add('active');
+  event.currentTarget.classList.add('active');
+}
+
+function toggleWF() {
+  wfEnabled = !wfEnabled;
+  const t = $('tr-wf-toggle');
+  t.classList.toggle('on', wfEnabled);
+  $('tr-wf-label').textContent = wfEnabled ? 'Enabled' : 'Disabled (80/20 split)';
+}
+
+function toggleRefresh() {
+  refreshEnabled = !refreshEnabled;
+  const t = $('tr-refresh-toggle');
+  t.classList.toggle('on', refreshEnabled);
+  $('tr-refresh-label').textContent = refreshEnabled ? 'Re-download data' : 'Use cache';
+}
+
+function clearLog() {
+  $('log').innerHTML = '';
+  foldsSeen = 0; totalFolds = 0;
+  $('fold-bar').style.width = '0';
+}
+
+function setStatusDot(state) {
+  const dot = $('status-dot');
+  dot.className = state; // 'training' | 'ok' | 'err' | ''
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   Status polling
+════════════════════════════════════════════════════════════════════ */
+async function pollStatus() {
+  try {
+    const r  = await fetch('/api/status');
+    const st = await r.json();
+    const hasMod = Object.values(st.models).some(Boolean);
+    if (st.training_running) {
+      $('status-text').textContent = 'Training…';
+      setStatusDot('training');
+    } else {
+      $('status-text').textContent = hasMod ? 'Model ready' : 'No model trained yet';
+      setStatusDot(hasMod ? 'ok' : '');
+    }
+  } catch (_) { /* server not up yet */ }
+}
+setInterval(pollStatus, 4000);
+pollStatus();
+
+/* ════════════════════════════════════════════════════════════════════
+   Training
+════════════════════════════════════════════════════════════════════ */
+function appendLog(text, cls = '') {
+  const log  = $('log');
+  const line = document.createElement('div');
+  line.className = 'log-line' + (cls ? ' ' + cls : '');
+  line.textContent = text;
+  log.appendChild(line);
+  log.scrollTop = log.scrollHeight;
+}
+
+function detectLineClass(text) {
+  if (/fold\s+\d+/i.test(text))      return 'fold';
+  if (/✔|completed|saved|model/i.test(text) && !/warning/i.test(text)) return 'done';
+  if (/✖|error|failed|traceback/i.test(text)) return 'err';
+  if (/===|───|training|backtest|computing/i.test(text)) return 'section';
+  return '';
+}
+
+function updateFoldBar(text) {
+  // Detect "Fold N  train=…" lines
+  const m = text.match(/Fold\s+(\d+)\s+train=/i);
+  if (m) {
+    foldsSeen = parseInt(m[1]) + 1;
+    // Estimate total folds from bar count hints if possible
+    if (totalFolds > 0) {
+      const pct = Math.min(100, (foldsSeen / totalFolds) * 100);
+      $('fold-bar').style.width = pct + '%';
+    }
+  }
+  // "Training (walk-forward CV) ..." — reset bar
+  if (/Training \(walk/i.test(text)) { foldsSeen = 0; $('fold-bar').style.width = '0'; }
+  // Try to infer total folds from something like "52 folds"
+  const fm = text.match(/(\d+)\s+fold/i);
+  if (fm) totalFolds = parseInt(fm[1]);
+  // Completed line
+  if (/avg val_acc/i.test(text)) $('fold-bar').style.width = '100%';
+}
+
+function connectWS() {
+  if (ws) { try { ws.close(); } catch (_) {} }
+  const proto = location.protocol === 'https:' ? 'wss' : 'ws';
+  ws = new WebSocket(`${proto}://${location.host}/ws/logs`);
+
+  ws.onmessage = ({ data }) => {
+    const msg = JSON.parse(data);
+    if (msg.type === 'line') {
+      const cls = detectLineClass(msg.text);
+      appendLog(msg.text, cls);
+      updateFoldBar(msg.text);
+    } else if (msg.type === 'idle') {
+      $('log-status').textContent = 'idle';
+      $('btn-start').disabled = false;
+      $('btn-stop').disabled  = true;
+      setStatusDot('ok');
+    }
+  };
+
+  ws.onclose = () => setTimeout(connectWS, 2000); // auto-reconnect
+}
+
+connectWS();
+
+async function startTraining() {
+  const interval = $('tr-interval').value;
+  const epochs   = parseInt($('tr-epochs').value) || 50;
+
+  $('btn-start').disabled = true;
+  $('btn-stop').disabled  = false;
+  $('log-status').textContent = 'training…';
+  setStatusDot('training');
+  appendLog(`▶ Starting training  interval=${interval}  epochs=${epochs}  walk_forward=${wfEnabled}`, 'section');
+  foldsSeen = 0; totalFolds = 0; $('fold-bar').style.width = '0';
+
+  const r = await fetch('/api/train/start', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ interval, epochs, walk_forward: wfEnabled, refresh: refreshEnabled }),
+  });
+  const j = await r.json();
+  if (j.error) {
+    appendLog('✖ ' + j.error, 'err');
+    $('btn-start').disabled = false;
+    $('btn-stop').disabled  = true;
+  }
+}
+
+async function stopTraining() {
+  await fetch('/api/train/stop', { method: 'POST' });
+  appendLog('◼ Stop requested.', 'err');
+  $('btn-stop').disabled  = true;
+  $('btn-start').disabled = false;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   Lightweight Charts helpers
+════════════════════════════════════════════════════════════════════ */
+const CHART_OPTS = (height) => ({
+  layout:  { background: { color: '#070712' }, textColor: '#8890b0' },
+  grid:    { vertLines: { color: '#141430' }, horzLines: { color: '#141430' } },
+  crosshair: { mode: LightweightCharts.CrosshairMode.Normal },
+  rightPriceScale: { borderColor: '#2a2a50' },
+  timeScale: { borderColor: '#2a2a50', timeVisible: true, secondsVisible: false },
+  height,
+});
+
+function initCharts() {
+  // Destroy old charts
+  if (candleChart) { candleChart.remove(); candleChart = null; }
+  if (equityChart) { equityChart.remove(); equityChart = null; }
+
+  const candleEl  = $('candle-chart');
+  const equityEl  = $('equity-chart');
+
+  candleChart  = LightweightCharts.createChart(candleEl,  CHART_OPTS(420));
+  equityChart  = LightweightCharts.createChart(equityEl,  CHART_OPTS(200));
+
+  candleSeries = candleChart.addCandlestickSeries({
+    upColor:   '#00c896', downColor: '#ff4d6d',
+    borderUpColor: '#00c896', borderDownColor: '#ff4d6d',
+    wickUpColor:   '#00c896', wickDownColor:   '#ff4d6d',
+  });
+
+  equitySeries = equityChart.addLineSeries({
+    color: '#7c6fff', lineWidth: 2,
+    priceLineVisible: false,
+  });
+
+  // Sync crosshair between charts
+  candleChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    if (range) equityChart.timeScale().setVisibleLogicalRange(range);
+  });
+  equityChart.timeScale().subscribeVisibleLogicalRangeChange(range => {
+    if (range) candleChart.timeScale().setVisibleLogicalRange(range);
+  });
+}
+
+function formatDuration(secs) {
+  if (secs < 60)   return `${secs}s`;
+  if (secs < 3600) return `${Math.floor(secs/60)}m ${Math.round(secs%60)}s`;
+  return `${Math.floor(secs/3600)}h ${Math.floor((secs%3600)/60)}m`;
+}
+
+/* ════════════════════════════════════════════════════════════════════
+   Backtest
+════════════════════════════════════════════════════════════════════ */
+async function runBacktest() {
+  const interval = $('bt-interval').value;
+  $('btn-bt-run').disabled        = true;
+  $('bt-running-msg').style.display = 'inline-flex';
+
+  // Reset stats
+  $('stats-grid').innerHTML = '<div class="notice" style="grid-column:1/-1">Running…</div>';
+
+  try {
+    const r    = await fetch('/api/backtest/run', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ interval }),
+    });
+    const data = await r.json();
+
+    if (data.error) {
+      $('stats-grid').innerHTML =
+        `<div class="notice" style="grid-column:1/-1;color:var(--red)">${data.error}</div>`;
+      return;
+    }
+
+    renderStats(data.analytics);
+    renderCharts(data.ohlcv, data.trades, data.equity_curve);
+    renderTradeTable(data.trades);
+
+  } catch (e) {
+    $('stats-grid').innerHTML =
+      `<div class="notice" style="grid-column:1/-1;color:var(--red)">Request failed: ${e}</div>`;
+  } finally {
+    $('btn-bt-run').disabled        = false;
+    $('bt-running-msg').style.display = 'none';
+  }
+}
+
+function renderStats(a) {
+  const retCls = a.total_return_pct >= 0 ? 'pos' : 'neg';
+  const shrCls = a.sharpe_ratio >= 0.5 ? 'pos' : (a.sharpe_ratio >= 0 ? 'neu' : 'neg');
+  const ddCls  = 'neg';
+  const cards  = [
+    { label: 'Total Return',   val: `${a.total_return_pct > 0 ? '+' : ''}${a.total_return_pct}%`, cls: retCls },
+    { label: 'Sharpe Ratio',   val: a.sharpe_ratio,      cls: shrCls },
+    { label: 'Max Drawdown',   val: `-${a.max_drawdown_pct}%`, cls: ddCls },
+    { label: 'Total Trades',   val: a.total_trades,      cls: 'neu' },
+    { label: 'Win Rate',       val: `${a.win_rate}%`,    cls: a.win_rate >= 50 ? 'pos' : 'neu' },
+    { label: 'Profit Factor',  val: a.profit_factor === 999 ? '∞' : a.profit_factor, cls: a.profit_factor > 1 ? 'pos' : 'neg' },
+    { label: 'Avg Win',        val: `$${a.avg_win.toLocaleString()}`,  cls: 'pos' },
+    { label: 'Avg Loss',       val: `$${a.avg_loss.toLocaleString()}`, cls: 'neg' },
+    { label: 'Expectancy',     val: `$${a.expectancy.toLocaleString()}`, cls: a.expectancy >= 0 ? 'pos' : 'neg' },
+  ];
+  $('stats-grid').innerHTML = cards.map(c =>
+    `<div class="stat-card">
+       <div class="stat-label">${c.label}</div>
+       <div class="stat-value ${c.cls}">${c.val}</div>
+     </div>`
+  ).join('');
+}
+
+function renderCharts(ohlcv, trades, equityCurve) {
+  initCharts();
+
+  if (ohlcv.length === 0) return;
+  candleSeries.setData(ohlcv);
+
+  // Build markers from trades
+  const markers = [];
+  const entryTimes = new Set();
+
+  trades.forEach(t => {
+    entryTimes.add(t.entry_time);
+    markers.push({
+      time:     t.entry_time,
+      position: t.side === 'LONG' ? 'belowBar' : 'aboveBar',
+      color:    t.side === 'LONG' ? '#00c896' : '#ff4d6d',
+      shape:    t.side === 'LONG' ? 'arrowUp' : 'arrowDown',
+      text:     `${t.side[0]}${t.qty}`,
+      size:     1.5,
+    });
+    // Exit marker — avoid overlap with an entry at the same time
+    const exitColor = t.net_pnl >= 0 ? '#00c896' : '#ff4d6d';
+    markers.push({
+      time:     t.exit_time,
+      position: t.side === 'LONG' ? 'aboveBar' : 'belowBar',
+      color:    exitColor,
+      shape:    'circle',
+      text:     `${t.net_pnl >= 0 ? '+' : ''}$${Math.round(t.net_pnl)}`,
+      size:     1,
+    });
+  });
+
+  // Sort markers by time (required by lightweight-charts)
+  markers.sort((a, b) => a.time - b.time);
+  candleSeries.setMarkers(markers);
+  candleChart.timeScale().fitContent();
+
+  // Equity curve
+  if (equityCurve.length > 0) {
+    equitySeries.setData(equityCurve);
+    equityChart.timeScale().fitContent();
+  }
+}
+
+function renderTradeTable(trades) {
+  $('trade-count').textContent = `${trades.length} trade${trades.length !== 1 ? 's' : ''}`;
+  if (trades.length === 0) {
+    $('trade-tbody').innerHTML =
+      '<tr><td colspan="9" style="text-align:center;color:var(--muted);padding:20px">No trades recorded.</td></tr>';
+    return;
+  }
+  $('trade-tbody').innerHTML = trades.map((t, i) => {
+    const pnlCls = t.net_pnl >= 0 ? 'pnl-pos' : 'pnl-neg';
+    const pnlStr = `${t.net_pnl >= 0 ? '+' : ''}$${t.net_pnl.toLocaleString()}`;
+    const sideTag = t.side === 'LONG'
+      ? '<span class="tag tag-long">LONG</span>'
+      : '<span class="tag tag-short">SHORT</span>';
+    return `<tr>
+      <td>${i + 1}</td>
+      <td>${sideTag}</td>
+      <td>${t.entry_label}</td>
+      <td>${t.entry_price.toLocaleString()}</td>
+      <td>${t.exit_label}</td>
+      <td>${t.exit_price.toLocaleString()}</td>
+      <td>${t.qty}</td>
+      <td>${formatDuration(t.duration_s)}</td>
+      <td class="${pnlCls}">${pnlStr}</td>
+    </tr>`;
+  }).join('');
+}
+</script>
+</body>
+</html>
