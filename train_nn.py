@@ -32,9 +32,10 @@ Saved files
   models/nn_ict_5m_metrics.json    -- per-fold metrics + config + backtest result
 
 Run:
-    python train_nn.py                        # 5m bars, walk-forward CV
-    python train_nn.py --interval 1h          # hourly bars
+    python train_nn.py                        # 1m bars, walk-forward CV (downloads 1yr)
+    python train_nn.py --interval 5m          # 5m bars (60-day yfinance limit)
     python train_nn.py --no-wf                # simple 80/20 split (faster)
+    python train_nn.py --refresh              # force re-download even if cache exists
 """
 
 from __future__ import annotations
@@ -140,24 +141,91 @@ def make_synthetic_bars(n: int, interval: str) -> list[Bar]:
 # Data loading
 # ---------------------------------------------------------------------------
 
-def load_bars(interval: str) -> list[Bar]:
-    cache = CACHE_DIR / f"{SYMBOL.replace('=', '')}_{interval}.parquet"
-    try:
-        feed = load_feed_from_cache(cache, symbol=SYMBOL,
-                                    contract_multiplier=MULTIPLIER)
-        print(f"  Loaded {feed._total} bars from cache: {cache}")
-        return feed._bars
-    except FileNotFoundError:
-        pass
+def _download_1m_chunked(ticker: str, days_back: int = 365) -> "pd.DataFrame":
+    """
+    Download 1m bars going back ``days_back`` calendar days by fetching
+    consecutive 7-day windows (yfinance hard limit for 1m data).
 
+    Returns a combined, deduplicated, chronologically sorted DataFrame.
+    """
+    import pandas as pd
+    try:
+        import yfinance as yf
+    except ImportError:
+        raise ImportError("yfinance not installed. Run: pip install yfinance")
+
+    end   = datetime.utcnow().replace(hour=0, minute=0, second=0, microsecond=0)
+    start = end - timedelta(days=days_back)
+
+    chunks = []
+    chunk_end = end
+    total_windows = (days_back + 6) // 7
+    fetched = 0
+
+    while chunk_end > start:
+        chunk_start = max(chunk_end - timedelta(days=7), start)
+        s = chunk_start.strftime("%Y-%m-%d")
+        e = chunk_end.strftime("%Y-%m-%d")
+        try:
+            df = yf.download(ticker, start=s, end=e, interval="1m",
+                             progress=False, auto_adjust=True)
+            if not df.empty:
+                chunks.append(df)
+                fetched += 1
+        except Exception as exc:
+            print(f"    Warning: chunk {s}→{e} failed ({exc}), skipping.")
+        chunk_end = chunk_start
+
+    if not chunks:
+        raise ValueError("All download chunks failed — no data retrieved.")
+
+    chunks.reverse()                                    # oldest first
+    combined = pd.concat(chunks)
+    combined = combined[~combined.index.duplicated(keep="first")]
+    combined.sort_index(inplace=True)
+    print(f"    Downloaded {len(combined):,} 1m bars across {fetched}/{total_windows} windows")
+    return combined
+
+
+def load_bars(interval: str, refresh: bool = False) -> list[Bar]:
+    import pandas as pd
+
+    cache = CACHE_DIR / f"{SYMBOL.replace('=', '')}_{interval}.parquet"
+
+    if not refresh:
+        try:
+            feed = load_feed_from_cache(cache, symbol=SYMBOL,
+                                        contract_multiplier=MULTIPLIER)
+            print(f"  Loaded {feed._total} bars from cache: {cache}")
+            return feed._bars
+        except FileNotFoundError:
+            pass
+
+    # 1m: stitch 7-day chunks to cover a full year
+    if interval == "1m":
+        try:
+            print(f"  Downloading 1m bars (1 year, ~52 weekly chunks) ...")
+            df = _download_1m_chunked(SYMBOL, days_back=365)
+            feed = DataFeed.from_dataframe(df, symbol=SYMBOL,
+                                           contract_multiplier=MULTIPLIER)
+            CACHE_DIR.mkdir(exist_ok=True)
+            save_feed(feed, cache)
+            print(f"  Saved {feed._total:,} bars → {cache}")
+            return feed._bars
+        except Exception as e:
+            print(f"  1m download failed ({e}). Using synthetic bars.")
+            return make_synthetic_bars(15_000, interval)
+
+    # Other intervals: single request (yfinance supports 60d for 5m/15m/1h)
     try:
         print(f"  Downloading {interval} bars from Yahoo Finance ...")
         feed = DataFeed.from_yfinance(SYMBOL, interval=interval,
                                       contract_multiplier=MULTIPLIER)
+        CACHE_DIR.mkdir(exist_ok=True)
         save_feed(feed, cache)
         return feed._bars
     except Exception as e:
-        n = {"1m": 15000, "5m": 5000, "15m": 3000, "1h": 1500}.get(interval, 5000)
+        n = {"5m": 5000, "15m": 3000, "1h": 1500}.get(interval, 3000)
         print(f"  Download failed ({e}). Using {n} synthetic bars.")
         return make_synthetic_bars(n, interval)
 
@@ -172,6 +240,8 @@ def main():
                         choices=["1m", "5m", "15m", "1h"])
     parser.add_argument("--no-wf", action="store_true",
                         help="Use simple 80/20 split instead of walk-forward CV")
+    parser.add_argument("--refresh", action="store_true",
+                        help="Force re-download data even if cache exists")
     parser.add_argument(
         "--device", default=None,
         help="Compute device: 'cuda', 'mps', 'cpu', or omit to auto-detect."
@@ -188,7 +258,7 @@ def main():
     print(f"{'='*60}")
 
     # 1. Load data
-    bars = load_bars(interval)
+    bars = load_bars(interval, refresh=args.refresh)
     n = len(bars)
     print(f"  Bars available: {n}")
 
