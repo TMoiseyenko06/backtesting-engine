@@ -15,7 +15,10 @@ import torch
 
 from backtesting.data_feed import Bar, DataFeed
 from backtesting.ml.dataset import SequenceDataset, make_labels, walk_forward_splits
-from backtesting.ml.features import ICTFeatureEngineer, N_FEATURES, FEATURE_NAMES
+from backtesting.ml.features import (
+    ICTFeatureEngineer, N_FEATURES, FEATURE_NAMES,
+    MultiTimeframeFeatureEngineer, N_MTF_FEATURES, aggregate_bars,
+)
 from backtesting.ml.model import LSTMSignalModel
 from backtesting.ml.trainer import Trainer
 
@@ -50,6 +53,54 @@ def _make_bars(n=200, interval_mins=5, seed=42) -> list[Bar]:
 # ---------------------------------------------------------------------------
 # Feature engineering tests
 # ---------------------------------------------------------------------------
+
+class TestAggregateBars:
+
+    def test_basic_grouping(self):
+        bars = _make_bars(120)
+        agg  = aggregate_bars(bars, 3)
+        assert len(agg) == 40
+
+    def test_ohlcv_correctness(self):
+        bars = _make_bars(12)
+        agg  = aggregate_bars(bars, 3)
+        # First aggregated bar covers bars[0..2]
+        assert agg[0].open  == bars[0].open
+        assert agg[0].close == bars[2].close
+        assert agg[0].high  == max(b.high for b in bars[:3])
+        assert agg[0].low   == min(b.low  for b in bars[:3])
+
+    def test_trailing_bars_dropped(self):
+        bars = _make_bars(100)
+        agg  = aggregate_bars(bars, 7)
+        assert len(agg) == 14   # 100 // 7 = 14
+
+
+class TestMultiTimeframeFeatureEngineer:
+
+    def test_output_shape(self):
+        bars = _make_bars(200)
+        eng  = MultiTimeframeFeatureEngineer()
+        feat = eng.transform(bars)
+        assert feat.shape == (200, N_MTF_FEATURES)
+
+    def test_n_features_property(self):
+        eng = MultiTimeframeFeatureEngineer()
+        assert eng.n_features == N_MTF_FEATURES
+
+    def test_no_nans(self):
+        bars = _make_bars(200)
+        feat = MultiTimeframeFeatureEngineer().transform(bars)
+        assert not np.isnan(feat).any()
+
+    def test_no_lookahead_early_bars(self):
+        # First 47 bars have no complete 4h candle → 4h block should be zeros
+        bars = _make_bars(50)
+        feat = MultiTimeframeFeatureEngineer().transform(bars)
+        # 4h block is the last 18 columns; first 47 rows should be zero
+        htf_4h = feat[:47, -18:]
+        assert (htf_4h == 0).all(), "4h features should be zeros before first complete 4h bar"
+
 
 class TestICTFeatureEngineer:
 
@@ -157,7 +208,7 @@ class TestSequenceDataset:
         return np.full((n, 2), [1.5, 2.5], dtype=np.float32)
 
     def test_length(self):
-        features = np.random.rand(200, N_FEATURES).astype(np.float32)
+        features = np.random.rand(200, N_MTF_FEATURES).astype(np.float32)
         labels   = np.ones(200, dtype=np.int8)
         sl_tp    = self._make_sl_tp(200)
         ds       = SequenceDataset(features, labels, sl_tp, seq_len=20)
@@ -165,17 +216,17 @@ class TestSequenceDataset:
         assert len(ds) == 181
 
     def test_item_shapes(self):
-        features = np.random.rand(100, N_FEATURES).astype(np.float32)
+        features = np.random.rand(100, N_MTF_FEATURES).astype(np.float32)
         labels   = np.zeros(100, dtype=np.int8)
         sl_tp    = self._make_sl_tp(100)
         ds       = SequenceDataset(features, labels, sl_tp, seq_len=15)
         x, y, y_sltp = ds[0]
-        assert x.shape    == (15, N_FEATURES)
-        assert y.shape    == ()
+        assert x.shape      == (15, N_MTF_FEATURES)
+        assert y.shape      == ()
         assert y_sltp.shape == (2,)
 
     def test_custom_indices(self):
-        features = np.random.rand(200, N_FEATURES).astype(np.float32)
+        features = np.random.rand(200, N_MTF_FEATURES).astype(np.float32)
         labels   = np.ones(200, dtype=np.int8)
         sl_tp    = self._make_sl_tp(200)
         indices  = list(range(100, 150))
@@ -217,8 +268,8 @@ class TestWalkForwardSplits:
 class TestLSTMSignalModel:
 
     def test_forward_shape(self):
-        model = LSTMSignalModel()
-        x = torch.randn(4, 30, N_FEATURES)
+        model = LSTMSignalModel()   # defaults to N_MTF_FEATURES=72
+        x = torch.randn(4, 30, N_MTF_FEATURES)
         logits, sl_tp = model(x)
         assert logits.shape == (4, 3)
         assert sl_tp.shape  == (4, 2)
@@ -226,7 +277,7 @@ class TestLSTMSignalModel:
 
     def test_predict_with_sl_tp(self):
         model = LSTMSignalModel()
-        x = torch.randn(1, 30, N_FEATURES)
+        x = torch.randn(1, 30, N_MTF_FEATURES)
         cls, conf, sl, tp = model.predict_with_sl_tp(x)
         assert cls in (0, 1, 2)
         assert 0.0 <= conf <= 1.0
@@ -235,31 +286,31 @@ class TestLSTMSignalModel:
 
     def test_predict_proba_sums_to_one(self):
         model = LSTMSignalModel()
-        x = torch.randn(2, 30, N_FEATURES)
+        x = torch.randn(2, 30, N_MTF_FEATURES)
         probs = model.predict_proba(x)
         assert torch.allclose(probs.sum(dim=-1), torch.ones(2), atol=1e-5)
 
     def test_predict_returns_valid_class(self):
         model = LSTMSignalModel()
-        x = torch.randn(1, 30, N_FEATURES)
+        x = torch.randn(1, 30, N_MTF_FEATURES)
         pred = model.predict(x)
         assert pred in (0, 1, 2)
 
-    def test_parameter_count_is_small(self):
+    def test_parameter_count_is_reasonable(self):
         model = LSTMSignalModel()
-        # Should be well under 100k params to avoid overfitting on small data
-        assert model.n_parameters < 100_000
+        # 72-feature × 128-hidden LSTM — larger than single-TF but still bounded
+        assert model.n_parameters < 1_000_000
 
-    def test_save_and_load(self):
+    def test_save_and_load_via_from_checkpoint(self):
         model = LSTMSignalModel()
-        x = torch.randn(1, 30, N_FEATURES)
+        x = torch.randn(1, 30, N_MTF_FEATURES)
         original_pred = model.predict(x)
 
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "model.pt"
             torch.save(model.state_dict(), path)
-            loaded = LSTMSignalModel()
-            Trainer.load_model(path, loaded)
+            # from_checkpoint auto-detects n_features
+            loaded = LSTMSignalModel.from_checkpoint(path, device="cpu")
             loaded_pred = loaded.predict(x)
 
         assert original_pred == loaded_pred
@@ -273,7 +324,7 @@ class TestTrainer:
 
     def _make_data(self, n=300):
         bars     = _make_bars(n)
-        eng      = ICTFeatureEngineer()
+        eng      = MultiTimeframeFeatureEngineer()
         features = eng.transform(bars)
         closes   = np.array([b.close for b in bars])
         highs    = np.array([b.high  for b in bars])
@@ -285,7 +336,7 @@ class TestTrainer:
 
     def test_fit_simple_runs(self):
         features, labels, sl_tp = self._make_data(300)
-        model   = LSTMSignalModel()
+        model   = LSTMSignalModel(n_features=features.shape[1])
         trainer = Trainer(model, seq_len=20, batch_size=32, epochs=2, patience=2,
                           device="cpu")
         result  = trainer.fit(features, labels, sl_tp, val_split=0.2)
@@ -295,7 +346,7 @@ class TestTrainer:
 
     def test_walk_forward_runs(self):
         features, labels, sl_tp = self._make_data(500)
-        model   = LSTMSignalModel()
+        model   = LSTMSignalModel(n_features=features.shape[1])
         trainer = Trainer(model, seq_len=20, batch_size=32, epochs=2, patience=2,
                           device="cpu")
         metrics = trainer.fit_walk_forward(
@@ -308,7 +359,7 @@ class TestTrainer:
 
     def test_trainer_save_load(self):
         features, labels, sl_tp = self._make_data(300)
-        model   = LSTMSignalModel()
+        model   = LSTMSignalModel(n_features=features.shape[1])
         trainer = Trainer(model, seq_len=20, batch_size=32, epochs=2, patience=2,
                           device="cpu")
         trainer.fit(features, labels, sl_tp)
@@ -317,8 +368,8 @@ class TestTrainer:
             path = Path(tmp) / "model.pt"
             trainer.save(path)
             assert path.exists()
-            loaded = LSTMSignalModel()
-            Trainer.load_model(path, loaded, device="cpu")
+            loaded = LSTMSignalModel.from_checkpoint(path, device="cpu")
+            assert loaded is not None
 
 
 # ---------------------------------------------------------------------------

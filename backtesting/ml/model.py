@@ -36,7 +36,7 @@ from __future__ import annotations
 
 import torch
 import torch.nn as nn
-from backtesting.ml.features import N_FEATURES
+from backtesting.ml.features import N_FEATURES, N_MTF_FEATURES
 
 # Safety bounds for predicted SL/TP ATR multiples
 SL_TP_MIN = 0.3
@@ -61,9 +61,32 @@ class LSTMSignalModel(nn.Module):
         Output classes: 3 (Buy=2, Flat=1, Sell=0).
     """
 
+    @classmethod
+    def from_checkpoint(
+        cls,
+        path,
+        device: str | None = None,
+    ) -> "LSTMSignalModel":
+        """
+        Load a saved model, auto-detecting ``n_features`` from the checkpoint
+        so you don't need to know the feature count at call time.
+        """
+        from backtesting.ml.trainer import select_device  # avoid circular import
+        if device is None:
+            device = select_device()
+        import torch
+        state = torch.load(path, map_location=device, weights_only=True)
+        # lstm.weight_ih_l0 shape: (4*hidden, n_features)
+        n_features = state["lstm.weight_ih_l0"].shape[1]
+        model = cls(n_features=n_features)
+        model.load_state_dict(state)
+        model.to(device)
+        model.eval()
+        return model
+
     def __init__(
         self,
-        n_features: int = N_FEATURES,
+        n_features: int = N_MTF_FEATURES,
         hidden_size: int = 64,
         num_layers: int = 2,
         lstm_dropout: float = 0.3,

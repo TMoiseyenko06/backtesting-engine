@@ -4,35 +4,27 @@ NNICTStrategy — Neural Network ICT Trading Strategy
 Uses the trained LSTMSignalModel to generate Buy/Sell/Flat signals and to
 set per-trade stop loss and take profit levels.
 
-Signal mapping
-~~~~~~~~~~~~~~
-  Model output 2 (Buy)  → enter long   (or exit short)
-  Model output 0 (Sell) → enter short  (or exit long)
-  Model output 1 (Flat) → do nothing   (or optionally exit)
+Multi-timeframe input
+~~~~~~~~~~~~~~~~~~~~~
+  The model sees 72 features per bar — ICT features computed at four
+  timeframes stacked together:
+    5m  (18 feats) : base execution timeframe
+    15m (18 feats) : last complete 15m candle (3 × 5m)
+    1h  (18 feats) : last complete 1h candle  (12 × 5m)
+    4h  (18 feats) : last complete 4h candle  (48 × 5m)
+
+  This gives the model context from micro structure (5m) all the way up to
+  the macro session trend (4h) without any lookahead.
 
 SL/TP — set by the neural network
 ~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~~
-  On every trade entry the model's regression head predicts two ATR multiples:
-    sl_atr_mult  — how far to place the stop loss from entry
-    tp_atr_mult  — how far to place the take profit from entry
-
-  For a LONG entry at price P with current ATR A:
-    stop_price = P - sl_atr_mult × A
-    tp_price   = P + tp_atr_mult × A
-
-  For a SHORT entry:
-    stop_price = P + sl_atr_mult × A
-    tp_price   = P - tp_atr_mult × A
-
-  The multiples are trained via MSE regression on the Max Adverse Excursion
-  (MAE) and Max Favorable Excursion (MFE) of the labelled Buy/Sell bars, so
-  the model learns context-sensitive levels rather than a fixed multiplier.
+  The regression head predicts [sl_atr_mult, tp_atr_mult] at trade entry.
+  For LONG:  stop = close − sl_mult × ATR,  tp = close + tp_mult × ATR
+  For SHORT: stop = close + sl_mult × ATR,  tp = close − tp_mult × ATR
 
 Confidence filter
 ~~~~~~~~~~~~~~~~~
-  The model outputs 3 softmax probabilities.  A trade is only entered if the
-  winning class probability exceeds `min_confidence` (default 0.50).
-  Raising this threshold reduces trade frequency but improves signal quality.
+  Only act if softmax confidence ≥ min_confidence (default 0.40).
 """
 
 from __future__ import annotations
@@ -46,9 +38,9 @@ import torch
 
 from backtesting.data_feed import Bar
 from backtesting.strategy import Strategy
-from backtesting.ml.features import ICTFeatureEngineer, N_FEATURES
+from backtesting.ml.features import MultiTimeframeFeatureEngineer
 from backtesting.ml.model import LSTMSignalModel
-from backtesting.ml.trainer import Trainer, select_device
+from backtesting.ml.trainer import select_device
 
 
 class NNICTStrategy(Strategy):
@@ -70,6 +62,9 @@ class NNICTStrategy(Strategy):
 
     name = "NN-ICT Strategy"
 
+    # 4h context needs ~10 complete 4h bars = 480 base bars + seq_len headroom
+    _MIN_BUFFER = 600
+
     def __init__(
         self,
         model_path: Optional[str | Path] = None,
@@ -83,22 +78,26 @@ class NNICTStrategy(Strategy):
         self.contracts      = contracts
         self.device         = device if device is not None else select_device()
 
-        self._model = LSTMSignalModel()
+        # Load model — auto-detects n_features from checkpoint weights
         if model_path and Path(model_path).exists():
             try:
-                Trainer.load_model(model_path, self._model, self.device)
+                self._model = LSTMSignalModel.from_checkpoint(model_path, self.device)
             except Exception as e:
                 print(
-                    f"  [NNICTStrategy] Warning: could not load model weights "
-                    f"from {model_path} ({e}). Using random initialisation. "
-                    f"Re-run train_nn.py to generate a compatible checkpoint."
+                    f"  [NNICTStrategy] Warning: could not load {model_path} ({e}). "
+                    f"Using random init. Re-run train_nn.py to rebuild checkpoint."
                 )
-        self._model.to(self.device)
+                self._model = LSTMSignalModel()
+                self._model.to(self.device)
+        else:
+            self._model = LSTMSignalModel()
+            self._model.to(self.device)
 
-        self._engineer = ICTFeatureEngineer()
+        self._engineer = MultiTimeframeFeatureEngineer()
 
-        # Rolling buffer of raw Bar objects for feature computation
-        self._bar_buffer: deque[Bar] = deque(maxlen=seq_len + 100)
+        # Buffer must hold enough history for 4h aggregation + seq window
+        buf_size = max(self._MIN_BUFFER, seq_len + self._MIN_BUFFER)
+        self._bar_buffer: deque[Bar] = deque(maxlen=buf_size)
 
         # Active stop / TP levels (set by the NN at trade entry)
         self._stop_price: Optional[float] = None
@@ -112,8 +111,9 @@ class NNICTStrategy(Strategy):
         self._bar_buffer.append(bar)
         bars: List[Bar] = list(self._bar_buffer)
 
-        # Need enough history for features + one full sequence
-        if len(bars) < self.seq_len + 20:
+        # Need enough history for the 4h aggregation (48 bars per candle,
+        # ~10 complete candles for ICT lookbacks) plus the LSTM sequence window
+        if len(bars) < self._MIN_BUFFER:
             return
 
         sym = bar.symbol

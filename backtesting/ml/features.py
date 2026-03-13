@@ -340,3 +340,120 @@ class ICTFeatureEngineer:
         body  = abs(closes[i] - opens[i])
         range_ = highs[i] - lows[i]
         return body / (range_ + 1e-9)
+
+
+# ---------------------------------------------------------------------------
+# Multi-timeframe utilities
+# ---------------------------------------------------------------------------
+
+# (mult, human-readable name, ICTFeatureEngineer kwargs)
+# Lookbacks are in bars of the given TF — smaller for higher TFs so the
+# bar buffer stays manageable at inference time.
+_TF_SPECS = [
+    (1,  "5m",  dict(swing_lookback=20, ob_lookback=50,  fvg_lookback=30, range_lookback=50)),
+    (3,  "15m", dict(swing_lookback=15, ob_lookback=30,  fvg_lookback=20, range_lookback=30)),
+    (12, "1h",  dict(swing_lookback=10, ob_lookback=20,  fvg_lookback=12, range_lookback=20)),
+    (48, "4h",  dict(swing_lookback=6,  ob_lookback=10,  fvg_lookback=6,  range_lookback=10)),
+]
+
+MTF_FEATURE_NAMES: List[str] = [
+    f"{tf_name}_{feat}"
+    for _, tf_name, _ in _TF_SPECS
+    for feat in FEATURE_NAMES
+]
+N_MTF_FEATURES: int = len(MTF_FEATURE_NAMES)   # 4 × 18 = 72
+
+
+def aggregate_bars(bars: List[Bar], n: int) -> List[Bar]:
+    """
+    Group every ``n`` consecutive base-timeframe bars into one OHLCV bar.
+
+    The aggregated bar's timestamp is the last bar in the group (i.e., the
+    bar that *closes* the higher-timeframe candle).  Only complete groups
+    are returned — trailing bars that don't fill a full group are dropped.
+    """
+    result = []
+    for start in range(0, len(bars) - n + 1, n):
+        group = bars[start: start + n]
+        result.append(Bar(
+            timestamp=group[-1].timestamp,
+            symbol=group[0].symbol,
+            open=group[0].open,
+            high=max(b.high for b in group),
+            low=min(b.low  for b in group),
+            close=group[-1].close,
+            volume=sum(b.volume for b in group),
+            contract_multiplier=group[0].contract_multiplier,
+        ))
+    return result
+
+
+class MultiTimeframeFeatureEngineer:
+    """
+    Stacks ICT features computed at four timeframes into one wide vector.
+
+    When the base timeframe is 5-minute bars:
+
+        5m  (mult=1)  : ICT features on 5m bars               →  18 features
+        15m (mult=3)  : ICT features on 3-bar aggregate candles →  18 features
+        1h  (mult=12) : ICT features on 12-bar aggregates       →  18 features
+        4h  (mult=48) : ICT features on 48-bar aggregates       →  18 features
+
+    Total: 72 features per base bar.
+
+    Higher-TF features are aligned with ZERO lookahead: for base bar ``i``
+    the higher-TF feature used is from the *last complete* HTF candle, i.e.
+    HTF candle index ``(i + 1) // mult - 1``.  Early bars that precede the
+    first complete HTF candle receive all-zeros for that TF block.
+
+    Minimum bar buffer needed (conservative):
+        4h lookback (10 agg bars) × 48 = 480 base bars
+    Use ``maxlen ≈ 600`` in the inference deque to be safe.
+    """
+
+    def __init__(self) -> None:
+        self._specs = _TF_SPECS
+        self._engineers = {
+            mult: ICTFeatureEngineer(**kwargs)
+            for mult, _, kwargs in _TF_SPECS
+        }
+
+    @property
+    def n_features(self) -> int:
+        return N_MTF_FEATURES
+
+    def transform(self, bars: List[Bar]) -> np.ndarray:
+        """
+        Parameters
+        ----------
+        bars : list of Bar  (base timeframe, e.g. 5m)
+
+        Returns
+        -------
+        np.ndarray  shape (n_bars, N_MTF_FEATURES=72), dtype float32
+        """
+        n = len(bars)
+        parts: List[np.ndarray] = []
+
+        for mult, _, _ in self._specs:
+            if mult == 1:
+                parts.append(self._engineers[1].transform(bars))
+            else:
+                agg = aggregate_bars(bars, mult)
+                if len(agg) == 0:
+                    parts.append(np.zeros((n, N_FEATURES), dtype=np.float32))
+                    continue
+
+                feat_htf = self._engineers[mult].transform(agg)   # (n_agg, 18)
+
+                # Vectorised alignment — no lookahead:
+                # last complete HTF bar for base bar i  =  (i+1)//mult - 1
+                idx = np.arange(n)
+                htf_idx = (idx + 1) // mult - 1
+                valid   = htf_idx >= 0
+                clamped = np.clip(htf_idx, 0, len(feat_htf) - 1)
+                aligned = feat_htf[clamped].copy()
+                aligned[~valid] = 0.0
+                parts.append(aligned)
+
+        return np.concatenate(parts, axis=1)

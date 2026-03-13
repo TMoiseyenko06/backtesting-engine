@@ -53,7 +53,7 @@ from backtesting.engine import BacktestEngine
 from backtesting.loaders.cache import save_feed, load_feed_from_cache
 from backtesting.ml.dataset import make_labels
 from backtesting.ml.trainer import select_device
-from backtesting.ml.features import ICTFeatureEngineer
+from backtesting.ml.features import ICTFeatureEngineer, MultiTimeframeFeatureEngineer
 from backtesting.ml.model import LSTMSignalModel
 from backtesting.ml.trainer import Trainer
 from backtesting.portfolio import Portfolio, MarginSpec
@@ -78,7 +78,7 @@ MODEL_DIR  = Path("models")
 SEQ_LEN      = 30      # bars per LSTM input window
 HORIZON      = 12      # bars forward for label
 THRESHOLD    = 0.5     # ATR-normalised return needed to label Buy/Sell
-HIDDEN_SIZE  = 64
+HIDDEN_SIZE  = 128   # wider for 4-TF × 18 = 72 input features
 EPOCHS       = 50
 LR           = 1e-3
 WEIGHT_DECAY = 0.05
@@ -183,9 +183,9 @@ def main():
               f"{WF_TRAIN_BARS + WF_VAL_BARS}. Switching to simple split.")
         args.no_wf = True
 
-    # 2. Feature engineering
-    print("  Computing ICT features ...")
-    engineer = ICTFeatureEngineer()
+    # 2. Feature engineering — 5m + 15m + 1h + 4h stacked
+    print("  Computing multi-timeframe ICT features (5m / 15m / 1h / 4h) ...")
+    engineer = MultiTimeframeFeatureEngineer()
     features = engineer.transform(bars)
     print(f"  Feature matrix: {features.shape}  ({features.shape[1]} features)")
 
@@ -206,11 +206,12 @@ def main():
     # 4. Model
     torch.manual_seed(42)
     model = LSTMSignalModel(
+        n_features=engineer.n_features,
         hidden_size=HIDDEN_SIZE,
         lstm_dropout=DROPOUT_LSTM,
         fc_dropout=DROPOUT_FC,
     )
-    print(f"  Model parameters: {model.n_parameters:,}")
+    print(f"  Model parameters: {model.n_parameters:,}  (n_features={engineer.n_features})")
 
     device = args.device  # None → auto-detect inside Trainer
     trainer = Trainer(
@@ -230,7 +231,8 @@ def main():
         "trained_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "model_path": str(model_path),
         "n_bars":     n,
-        "n_features": int(features.shape[1]),
+        "n_features":    int(features.shape[1]),
+        "timeframes":    ["5m", "15m", "1h", "4h"],
         "label_pct":  {"buy": round(buy_pct, 2),
                        "sell": round(sell_pct, 2),
                        "flat": round(flat_pct, 2)},
