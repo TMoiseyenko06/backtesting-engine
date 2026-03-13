@@ -209,9 +209,14 @@ class NNICTStrategy(Strategy):
     # Inference
     # ------------------------------------------------------------------
 
+    # Minimum 1m bars before the seq window needed for valid HTF features.
+    # 4 × 4h = 960 bars gives several complete 4h candles for context.
+    _HTF_CONTEXT = 960
+
     def _infer(self, bars: List[Bar]) -> tuple[int, float, float, float]:
         """Returns (predicted_class, confidence, sl_atr_mult, tp_atr_mult)."""
-        feat_matrix = self._engineer.transform(bars)
+        window = bars[-(self.seq_len + self._HTF_CONTEXT):]
+        feat_matrix = self._engineer.transform(window)
 
         # Append drawdown_frac column — must match the feature added during training.
         # Value = fraction of max_drawdown consumed (0=none, 1=limit hit).
