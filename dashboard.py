@@ -221,7 +221,7 @@ def _run_backtest(interval: str) -> dict:
     SYMBOL        = "NQ=F"
     MULTIPLIER    = 20.0
     CASH          = 50_000.0
-    MAX_CONTRACTS = 4
+    MAX_CONTRACTS = 1
     MAX_DAILY_LOSS    = 1_500.0
     MAX_DRAWDOWN_USD  = 2_500.0
     INIT_MARGIN   = 12_000.0

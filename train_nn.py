@@ -71,7 +71,7 @@ MULTIPLIER = 20.0
 
 # Prop firm account settings
 CASH         = 50_000.0    # starting capital
-MAX_CONTRACTS = 4           # hard position cap (prop firm rule)
+MAX_CONTRACTS = 1           # default contract size; scale up once strategy is proven
 MAX_DAILY_LOSS    = 1_500.0 # stop trading today if daily loss reaches this
 MAX_DRAWDOWN_USD  = 2_500.0 # halt account if trailing drawdown reaches this
 
