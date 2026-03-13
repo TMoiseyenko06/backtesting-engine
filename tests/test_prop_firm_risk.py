@@ -16,33 +16,44 @@ def _ts(hour: int, minute: int = 0) -> datetime:
 
 class TestSessionHours:
 
-    def test_inside_rth(self):
+    def test_inside_session_rth(self):
         r = PropFirmRisk()
-        # 10:00 AM ET = 14:00 UTC (EDT)
-        assert r.is_in_session(_ts(14, 0)) is True
-        assert r.is_in_session(_ts(13, 30)) is True   # exact open
-        assert r.is_in_session(_ts(19, 59)) is True   # one minute before close
+        assert r.is_in_session(_ts(14, 0))  is True   # 10:00 AM ET
+        assert r.is_in_session(_ts(13, 30)) is True   # 9:30 AM ET
+        assert r.is_in_session(_ts(19, 59)) is True   # 3:59 PM ET
 
-    def test_outside_rth_premarket(self):
+    def test_inside_session_overnight(self):
         r = PropFirmRisk()
-        assert r.is_in_session(_ts(12, 0)) is False   # 8:00 AM ET
-        assert r.is_in_session(_ts(0, 0))  is False   # midnight
+        # Futures trade overnight — all of these should be in-session
+        assert r.is_in_session(_ts(0,  0)) is True    # midnight UTC
+        assert r.is_in_session(_ts(8,  0)) is True    # 4:00 AM ET
+        assert r.is_in_session(_ts(22, 0)) is True    # 6:00 PM ET (market reopens)
+        assert r.is_in_session(_ts(22, 1)) is True    # just after reopen
 
-    def test_outside_rth_afterhours(self):
+    def test_outside_session_maintenance(self):
         r = PropFirmRisk()
-        assert r.is_in_session(_ts(20, 0)) is False   # 4:00 PM ET exactly
-        assert r.is_in_session(_ts(21, 0)) is False   # 5:00 PM ET
+        # Maintenance window: 21:00–22:00 UTC (5:00–6:00 PM ET)
+        assert r.is_in_session(_ts(21, 0))  is False  # exact start of maintenance
+        assert r.is_in_session(_ts(21, 30)) is False  # mid-maintenance
+        assert r.is_in_session(_ts(21, 59)) is False  # last minute of maintenance
 
     def test_should_close_at_entry_cutoff(self):
         r = PropFirmRisk()
-        # Entry cutoff is 19:55 UTC (3:55 PM ET)
-        assert r.should_close(_ts(19, 55)) is True
-        assert r.should_close(_ts(19, 54)) is False   # one minute before
+        # Entry cutoff is 20:55 UTC (4:55 PM ET) — 5 min before maintenance
+        assert r.should_close(_ts(20, 55)) is True
+        assert r.should_close(_ts(20, 54)) is False   # one minute before
 
-    def test_should_close_overnight(self):
+    def test_should_close_during_maintenance(self):
         r = PropFirmRisk()
-        assert r.should_close(_ts(22, 0)) is True    # 6 PM ET — after hours
-        assert r.should_close(_ts(8,  0)) is True    # pre-market
+        assert r.should_close(_ts(21, 0))  is True    # 5:00 PM ET maintenance
+        assert r.should_close(_ts(21, 30)) is True    # mid-maintenance
+
+    def test_should_not_close_overnight(self):
+        r = PropFirmRisk()
+        # Overnight is normal futures trading — no force-close
+        assert r.should_close(_ts(22, 0)) is False    # 6:00 PM ET market reopens
+        assert r.should_close(_ts(0,  0)) is False    # midnight
+        assert r.should_close(_ts(8,  0)) is False    # pre-RTH overnight
 
 
 class TestDrawdownRules:

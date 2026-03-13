@@ -8,15 +8,13 @@ Implements the risk guardrails for a $50k NQ futures prop firm account:
   Rule 3  Max trailing drawdown $2,500 — trading permanently halted if
           equity falls $2,500 below the running peak (or initial equity,
           whichever is higher)
-  Rule 4  RTH-only — no overnight positions:
-          • All open positions force-closed by 3:55 PM ET
-          • No new entries outside 9:30 AM – 3:55 PM ET
-  Rule 5  Trade consistency — short-circuit entries outside kill zones
-          to bias towards the most liquid intraday windows
+  Rule 4  Session-aware — NQ futures trade ~23 hours/day with a 1-hour
+          maintenance break from 5:00 PM – 6:00 PM ET (21:00–22:00 UTC).
+          • All open positions force-closed by 4:55 PM ET (5 min buffer)
+          • No new entries during the maintenance window (21:00–22:00 UTC)
 
 Times are expressed in UTC using EDT (UTC-4) as the baseline, which is
-accurate for ~Mar–Nov.  In EST months (Nov–Mar) this shifts by 1 hour
-but remains conservative (no after-hours holding).
+accurate for ~Mar–Nov.  In EST months (Nov–Mar) this shifts by 1 hour.
 
 Usage inside a strategy:
     risk = PropFirmRisk(initial_equity=50_000)
@@ -59,11 +57,10 @@ class PropFirmRisk:
         Starting account equity (default $50,000).
     """
 
-    # UTC times (EDT baseline = UTC-4, accurate ~Mar–Nov)
-    # In EST months shift is 1h earlier — still no after-hours holding
-    _SESSION_START_MINS = 13 * 60 + 30   # 13:30 UTC ≈ 09:30 ET
-    _SESSION_CLOSE_MINS = 20 * 60 +  0   # 20:00 UTC ≈ 16:00 ET
-    _ENTRY_CUTOFF_MINS  = 19 * 60 + 55   # 19:55 UTC ≈ 15:55 ET  (5 min buffer)
+    # NQ futures maintenance break: 5:00–6:00 PM ET = 21:00–22:00 UTC (EDT)
+    _MAINT_START_MINS  = 21 * 60       # 21:00 UTC = 5:00 PM ET — close begins
+    _MAINT_END_MINS    = 22 * 60       # 22:00 UTC = 6:00 PM ET — market reopens
+    _ENTRY_CUTOFF_MINS = 20 * 60 + 55  # 20:55 UTC = 4:55 PM ET — 5 min buffer
 
     def __init__(
         self,
@@ -102,20 +99,19 @@ class PropFirmRisk:
     # ------------------------------------------------------------------
 
     def is_in_session(self, ts: datetime) -> bool:
-        """True if the bar falls within RTH (9:30 AM – 4:00 PM ET)."""
+        """True outside the 1-hour maintenance break (5–6 PM ET / 21:00–22:00 UTC).
+        NQ futures trade ~23 hours/day; only the maintenance window is excluded."""
         t = ts.hour * 60 + ts.minute
-        return self._SESSION_START_MINS <= t < self._SESSION_CLOSE_MINS
+        return not (self._MAINT_START_MINS <= t < self._MAINT_END_MINS)
 
     def should_close(self, ts: datetime) -> bool:
         """
         True when any open position should be immediately closed:
-          • Within 5 minutes of the session close (≥ 15:55 ET)
-          • Any bar outside RTH (overnight / pre-market)
+          • Within 5 minutes of the maintenance window (≥ 4:55 PM ET)
+          • During the maintenance window itself (5:00–6:00 PM ET)
         """
         t = ts.hour * 60 + ts.minute
-        past_cutoff   = t >= self._ENTRY_CUTOFF_MINS
-        pre_session   = t <  self._SESSION_START_MINS
-        return past_cutoff or pre_session
+        return t >= self._ENTRY_CUTOFF_MINS and t < self._MAINT_END_MINS
 
     def can_enter(self, equity: float) -> bool:
         """
