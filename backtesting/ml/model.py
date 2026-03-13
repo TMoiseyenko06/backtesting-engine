@@ -77,8 +77,10 @@ class LSTMSignalModel(nn.Module):
         import torch
         state = torch.load(path, map_location=device, weights_only=True)
         # lstm.weight_ih_l0 shape: (4*hidden, n_features)
-        n_features = state["lstm.weight_ih_l0"].shape[1]
-        model = cls(n_features=n_features)
+        ih = state["lstm.weight_ih_l0"]
+        n_features  = ih.shape[1]
+        hidden_size = ih.shape[0] // 4
+        model = cls(n_features=n_features, hidden_size=hidden_size)
         model.load_state_dict(state)
         model.to(device)
         model.eval()
