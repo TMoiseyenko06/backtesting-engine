@@ -284,6 +284,24 @@ def main():
         closes, highs, lows, atr, horizon=HORIZON, threshold=THRESHOLD
     )
 
+    # 3b. Drawdown feature — fraction of max drawdown consumed (0=none, 1=limit hit).
+    # Simulates how much of the $MAX_DRAWDOWN_USD would be used if MAX_CONTRACTS were
+    # held throughout.  Teaches the NN that trading when drawdown≥1 is always wrong.
+    peak_close  = np.maximum.accumulate(closes)
+    dd_frac     = np.clip(
+        (peak_close - closes) * MAX_CONTRACTS * MULTIPLIER / MAX_DRAWDOWN_USD,
+        0.0, 2.0,
+    ).astype(np.float32)
+    features = np.column_stack([features, dd_frac])
+
+    # Force Flat label wherever simulated drawdown would have hit the limit
+    breached = dd_frac >= 1.0
+    n_breached = int(breached.sum())
+    if n_breached:
+        labels[breached] = 1  # Flat — never trade when limit is reached
+        print(f"  Drawdown feature: {n_breached:,} bars ({n_breached/n*100:.1f}%) "
+              f"relabelled Flat (drawdown limit reached)")
+
     buy_pct  = float((labels == 2).mean() * 100)
     sell_pct = float((labels == 0).mean() * 100)
     flat_pct = float((labels == 1).mean() * 100)
@@ -292,7 +310,7 @@ def main():
     # 4. Model
     torch.manual_seed(42)
     model = LSTMSignalModel(
-        n_features=engineer.n_features,
+        n_features=features.shape[1],
         hidden_size=HIDDEN_SIZE,
         lstm_dropout=DROPOUT_LSTM,
         fc_dropout=DROPOUT_FC,
@@ -317,7 +335,7 @@ def main():
         "trained_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
         "model_path": str(model_path),
         "n_bars":     n,
-        "n_features":    int(features.shape[1]),
+        "n_features":    int(features.shape[1]),   # MTF features + drawdown_frac
         "timeframes":    ["1m", "5m", "15m", "1h", "4h"],
         "label_pct":  {"buy": round(buy_pct, 2),
                        "sell": round(sell_pct, 2),

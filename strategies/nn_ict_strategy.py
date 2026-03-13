@@ -208,6 +208,20 @@ class NNICTStrategy(Strategy):
     def _infer(self, bars: List[Bar]) -> tuple[int, float, float, float]:
         """Returns (predicted_class, confidence, sl_atr_mult, tp_atr_mult)."""
         feat_matrix = self._engineer.transform(bars)
+
+        # Append drawdown_frac column — must match the feature added during training.
+        # Value = fraction of max_drawdown consumed (0=none, 1=limit hit).
+        if self.prop_rules is not None:
+            eq = self.equity()
+            dd_frac = float(np.clip(
+                (self.prop_rules._peak_equity - eq) / self.prop_rules.max_drawdown,
+                0.0, 2.0,
+            ))
+        else:
+            dd_frac = 0.0
+        dd_col = np.full((len(feat_matrix), 1), dd_frac, dtype=np.float32)
+        feat_matrix = np.column_stack([feat_matrix, dd_col])
+
         seq = feat_matrix[-self.seq_len:]
         if len(seq) < self.seq_len:
             return 1, 0.0, 1.5, 2.5   # Flat / insufficient data
