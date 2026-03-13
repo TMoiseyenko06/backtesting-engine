@@ -131,6 +131,7 @@ async def api_train_start(params: TrainParams) -> dict:
 
     cmd = [
         sys.executable,
+        "-u",                           # force unbuffered stdout so lines stream live
         str(ROOT / "train_nn.py"),
         "--interval", params.interval,
         "--epochs",   str(params.epochs),

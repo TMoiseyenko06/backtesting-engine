@@ -43,7 +43,7 @@ from __future__ import annotations
 import argparse
 import json
 import random
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import numpy as np
@@ -330,7 +330,7 @@ def main():
     # Build the run log that will be saved to JSON
     run_log: dict = {
         "interval":   interval,
-        "trained_at": datetime.utcnow().isoformat(timespec="seconds") + "Z",
+        "trained_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
         "model_path": str(model_path),
         "n_bars":     n,
         "n_features":    int(features.shape[1]),   # MTF features + drawdown_frac
