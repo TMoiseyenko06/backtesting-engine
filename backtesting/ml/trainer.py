@@ -192,7 +192,7 @@ class Trainer:
                 "elapsed_s":  round(elapsed, 1),
             }
             fold_metrics.append(metrics)
-            gap_flag = "  ⚠ overfit" if gap > 0.12 else ""
+            gap_flag = "  [overfit]" if gap > 0.12 else ""
             print(
                 f"  Fold {fold_idx:>2}  train={len(train_ds):>5}  val={len(val_ds):>5}"
                 f"  train_acc={train_acc:.3f}  val_acc={val_acc:.3f}"

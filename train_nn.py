@@ -421,15 +421,15 @@ def main():
         result = BacktestEngine(feed, portfolio, [strategy], verbose=False).run()
         a = result.analytics
 
-        print(f"\n  {'─'*50}")
+        print(f"\n  {'-'*50}")
         print(f"  Hold-out backtest results (last 20% of bars)")
-        print(f"  {'─'*50}")
+        print(f"  {'-'*50}")
         print(f"  Total return   : {a.total_return_pct:>+8.2f}%")
         print(f"  Sharpe ratio   : {a.sharpe_ratio:>8.3f}")
         print(f"  Max drawdown   : {a.max_drawdown_pct:>8.2f}%")
         print(f"  Total trades   : {a.total_trades:>8}")
         print(f"  Win rate       : {a.win_rate:>8.1f}%")
-        print(f"  {'─'*50}\n")
+        print(f"  {'-'*50}\n")
         print(
             "  Realistic expectations:\n"
             "  - Sharpe > 0.5 on unseen data = viable edge\n"

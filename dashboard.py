@@ -157,10 +157,10 @@ async def api_train_start(params: TrainParams) -> dict:
             proc.wait()
             code = proc.returncode
             _train.add(
-                f"\n{'✔ Training completed' if code == 0 else f'✖ Process exited (code {code})'}"
+                f"\n{'[OK] Training completed' if code == 0 else f'[FAIL] Process exited (code {code})'}"
             )
         except Exception as exc:
-            _train.add(f"✖ Error: {exc}")
+            _train.add(f"[ERROR] {exc}")
         finally:
             _train.running = False
 
