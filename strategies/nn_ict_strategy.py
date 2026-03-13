@@ -72,8 +72,8 @@ class NNICTStrategy(Strategy):
 
     name = "NN-ICT Strategy"
 
-    # 4h context needs ~10 complete 4h bars = 480 base bars + seq headroom
-    _MIN_BUFFER = 600
+    # 4h context needs ~10 complete 4h bars = 2,400 1m bars + seq headroom
+    _MIN_BUFFER = 2500
 
     def __init__(
         self,

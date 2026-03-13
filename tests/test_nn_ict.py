@@ -94,11 +94,11 @@ class TestMultiTimeframeFeatureEngineer:
         assert not np.isnan(feat).any()
 
     def test_no_lookahead_early_bars(self):
-        # First 47 bars have no complete 4h candle → 4h block should be zeros
-        bars = _make_bars(50)
+        # Base is 1m; first complete 4h candle needs 240 bars.
+        # Rows 0..238 must have all-zero 4h block (last 18 columns).
+        bars = _make_bars(300)
         feat = MultiTimeframeFeatureEngineer().transform(bars)
-        # 4h block is the last 18 columns; first 47 rows should be zero
-        htf_4h = feat[:47, -18:]
+        htf_4h = feat[:239, -18:]
         assert (htf_4h == 0).all(), "4h features should be zeros before first complete 4h bar"
 
 
@@ -268,7 +268,7 @@ class TestWalkForwardSplits:
 class TestLSTMSignalModel:
 
     def test_forward_shape(self):
-        model = LSTMSignalModel()   # defaults to N_MTF_FEATURES=72
+        model = LSTMSignalModel()   # defaults to N_MTF_FEATURES=90
         x = torch.randn(4, 30, N_MTF_FEATURES)
         logits, sl_tp = model(x)
         assert logits.shape == (4, 3)
@@ -298,7 +298,7 @@ class TestLSTMSignalModel:
 
     def test_parameter_count_is_reasonable(self):
         model = LSTMSignalModel()
-        # 72-feature × 128-hidden LSTM — larger than single-TF but still bounded
+        # 90-feature × 128-hidden LSTM — larger than single-TF but still bounded
         assert model.n_parameters < 1_000_000
 
     def test_save_and_load_via_from_checkpoint(self):

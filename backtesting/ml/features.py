@@ -347,13 +347,15 @@ class ICTFeatureEngineer:
 # ---------------------------------------------------------------------------
 
 # (mult, human-readable name, ICTFeatureEngineer kwargs)
+# Base timeframe is 1m.  Multipliers: 1=1m, 5=5m, 15=15m, 60=1h, 240=4h.
 # Lookbacks are in bars of the given TF — smaller for higher TFs so the
 # bar buffer stays manageable at inference time.
 _TF_SPECS = [
-    (1,  "5m",  dict(swing_lookback=20, ob_lookback=50,  fvg_lookback=30, range_lookback=50)),
-    (3,  "15m", dict(swing_lookback=15, ob_lookback=30,  fvg_lookback=20, range_lookback=30)),
-    (12, "1h",  dict(swing_lookback=10, ob_lookback=20,  fvg_lookback=12, range_lookback=20)),
-    (48, "4h",  dict(swing_lookback=6,  ob_lookback=10,  fvg_lookback=6,  range_lookback=10)),
+    (1,   "1m",  dict(swing_lookback=20, ob_lookback=50,  fvg_lookback=30, range_lookback=50)),
+    (5,   "5m",  dict(swing_lookback=20, ob_lookback=50,  fvg_lookback=30, range_lookback=50)),
+    (15,  "15m", dict(swing_lookback=15, ob_lookback=30,  fvg_lookback=20, range_lookback=30)),
+    (60,  "1h",  dict(swing_lookback=10, ob_lookback=20,  fvg_lookback=12, range_lookback=20)),
+    (240, "4h",  dict(swing_lookback=6,  ob_lookback=10,  fvg_lookback=6,  range_lookback=10)),
 ]
 
 MTF_FEATURE_NAMES: List[str] = [
@@ -361,7 +363,7 @@ MTF_FEATURE_NAMES: List[str] = [
     for _, tf_name, _ in _TF_SPECS
     for feat in FEATURE_NAMES
 ]
-N_MTF_FEATURES: int = len(MTF_FEATURE_NAMES)   # 4 × 18 = 72
+N_MTF_FEATURES: int = len(MTF_FEATURE_NAMES)   # 5 × 18 = 90
 
 
 def aggregate_bars(bars: List[Bar], n: int) -> List[Bar]:
@@ -390,16 +392,17 @@ def aggregate_bars(bars: List[Bar], n: int) -> List[Bar]:
 
 class MultiTimeframeFeatureEngineer:
     """
-    Stacks ICT features computed at four timeframes into one wide vector.
+    Stacks ICT features computed at five timeframes into one wide vector.
 
-    When the base timeframe is 5-minute bars:
+    Base timeframe is 1-minute bars:
 
-        5m  (mult=1)  : ICT features on 5m bars               →  18 features
-        15m (mult=3)  : ICT features on 3-bar aggregate candles →  18 features
-        1h  (mult=12) : ICT features on 12-bar aggregates       →  18 features
-        4h  (mult=48) : ICT features on 48-bar aggregates       →  18 features
+        1m  (mult=1)   : ICT features on raw 1m bars            →  18 features
+        5m  (mult=5)   : ICT features on 5-bar aggregates        →  18 features
+        15m (mult=15)  : ICT features on 15-bar aggregates       →  18 features
+        1h  (mult=60)  : ICT features on 60-bar aggregates       →  18 features
+        4h  (mult=240) : ICT features on 240-bar aggregates      →  18 features
 
-    Total: 72 features per base bar.
+    Total: 90 features per base bar.
 
     Higher-TF features are aligned with ZERO lookahead: for base bar ``i``
     the higher-TF feature used is from the *last complete* HTF candle, i.e.
@@ -407,8 +410,8 @@ class MultiTimeframeFeatureEngineer:
     first complete HTF candle receive all-zeros for that TF block.
 
     Minimum bar buffer needed (conservative):
-        4h lookback (10 agg bars) × 48 = 480 base bars
-    Use ``maxlen ≈ 600`` in the inference deque to be safe.
+        4h lookback (10 agg bars) × 240 = 2,400 base bars
+    Use ``maxlen ≈ 2500`` in the inference deque to be safe.
     """
 
     def __init__(self) -> None:
@@ -426,11 +429,11 @@ class MultiTimeframeFeatureEngineer:
         """
         Parameters
         ----------
-        bars : list of Bar  (base timeframe, e.g. 5m)
+        bars : list of Bar  (base timeframe: 1m)
 
         Returns
         -------
-        np.ndarray  shape (n_bars, N_MTF_FEATURES=72), dtype float32
+        np.ndarray  shape (n_bars, N_MTF_FEATURES=90), dtype float32
         """
         n = len(bars)
         parts: List[np.ndarray] = []

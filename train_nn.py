@@ -83,11 +83,14 @@ TICK_SIZE    = 0.25
 CACHE_DIR  = Path("data")
 MODEL_DIR  = Path("models")
 
-# Training hyper-parameters (intentionally conservative)
-SEQ_LEN      = 30      # bars per LSTM input window
-HORIZON      = 12      # bars forward for label
+# Training hyper-parameters
+# Base timeframe is 1m, so all bar counts are in 1-minute units:
+#   SEQ_LEN=60  → 60 minutes of context per inference
+#   HORIZON=30  → label looks 30 minutes ahead
+SEQ_LEN      = 60      # bars per LSTM input window  (60 min)
+HORIZON      = 30      # bars forward for label       (30 min)
 THRESHOLD    = 0.5     # ATR-normalised return needed to label Buy/Sell
-HIDDEN_SIZE  = 128   # wider for 4-TF × 18 = 72 input features
+HIDDEN_SIZE  = 128     # 5-TF × 18 = 90 input features
 EPOCHS       = 50
 LR           = 1e-3
 WEIGHT_DECAY = 0.05
@@ -96,10 +99,10 @@ DROPOUT_FC   = 0.4
 BATCH_SIZE   = 64
 PATIENCE     = 10      # early stopping patience
 
-# Walk-forward params
-WF_TRAIN_BARS = 2000   # initial training window
-WF_VAL_BARS   = 500    # validation window per fold
-WF_STEP_BARS  = 500    # advance per fold
+# Walk-forward params  (1m bars — ~1 trading week = ~2,400 bars)
+WF_TRAIN_BARS = 5000   # initial training window (~2 weeks of 1m bars)
+WF_VAL_BARS   = 1000   # validation window per fold
+WF_STEP_BARS  = 1000   # advance per fold
 
 
 # ---------------------------------------------------------------------------
@@ -152,7 +155,7 @@ def load_bars(interval: str) -> list[Bar]:
         save_feed(feed, cache)
         return feed._bars
     except Exception as e:
-        n = {"1m": 1000, "5m": 3000, "15m": 2000, "1h": 1500}.get(interval, 2000)
+        n = {"1m": 15000, "5m": 5000, "15m": 3000, "1h": 1500}.get(interval, 5000)
         print(f"  Download failed ({e}). Using {n} synthetic bars.")
         return make_synthetic_bars(n, interval)
 
@@ -163,7 +166,7 @@ def load_bars(interval: str) -> list[Bar]:
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--interval", default="5m",
+    parser.add_argument("--interval", default="1m",
                         choices=["1m", "5m", "15m", "1h"])
     parser.add_argument("--no-wf", action="store_true",
                         help="Use simple 80/20 split instead of walk-forward CV")
@@ -192,8 +195,8 @@ def main():
               f"{WF_TRAIN_BARS + WF_VAL_BARS}. Switching to simple split.")
         args.no_wf = True
 
-    # 2. Feature engineering — 5m + 15m + 1h + 4h stacked
-    print("  Computing multi-timeframe ICT features (5m / 15m / 1h / 4h) ...")
+    # 2. Feature engineering — 1m + 5m + 15m + 1h + 4h stacked
+    print("  Computing multi-timeframe ICT features (1m / 5m / 15m / 1h / 4h) ...")
     engineer = MultiTimeframeFeatureEngineer()
     features = engineer.transform(bars)
     print(f"  Feature matrix: {features.shape}  ({features.shape[1]} features)")
@@ -241,7 +244,7 @@ def main():
         "model_path": str(model_path),
         "n_bars":     n,
         "n_features":    int(features.shape[1]),
-        "timeframes":    ["5m", "15m", "1h", "4h"],
+        "timeframes":    ["1m", "5m", "15m", "1h", "4h"],
         "label_pct":  {"buy": round(buy_pct, 2),
                        "sell": round(sell_pct, 2),
                        "flat": round(flat_pct, 2)},
