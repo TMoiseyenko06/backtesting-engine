@@ -163,9 +163,9 @@ class Trainer:
                 f"val_bars={val_bars}.  Need at least train_bars + val_bars bars."
             )
 
-        fold_metrics = []
+        fold_metrics  = []
         best_val_acc  = -1.0
-        best_state    = None
+        last_state    = None   # weights from the final completed fold
 
         for fold_idx, (train_idx, val_idx) in enumerate(folds):
             t0 = time.time()
@@ -197,11 +197,15 @@ class Trainer:
 
             if val_acc > best_val_acc:
                 best_val_acc = val_acc
-                best_state   = copy.deepcopy(self.model.state_dict())
 
-        if best_state is not None:
-            self.model.load_state_dict(best_state)
-            print(f"\n  Best fold val_acc = {best_val_acc:.3f}")
+            # Always keep the last completed fold's weights — for time-series
+            # deployment the most-recently-trained model (largest training set,
+            # closest in time to the hold-out period) is the most relevant.
+            last_state = copy.deepcopy(self.model.state_dict())
+
+        if last_state is not None:
+            self.model.load_state_dict(last_state)
+            print(f"\n  Using last-fold model  (best fold val_acc = {best_val_acc:.3f})")
 
         if save_path:
             self.save(save_path)

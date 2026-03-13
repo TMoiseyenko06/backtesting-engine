@@ -287,7 +287,7 @@ def main():
     strategy = NNICTStrategy(
         model_path=model_path,
         seq_len=SEQ_LEN,
-        min_confidence=0.50,
+        min_confidence=0.40,
         contracts=1,
     )
     test_bars = bars[int(n * 0.8):]

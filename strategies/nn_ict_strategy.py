@@ -74,7 +74,7 @@ class NNICTStrategy(Strategy):
         self,
         model_path: Optional[str | Path] = None,
         seq_len: int = 30,
-        min_confidence: float = 0.50,
+        min_confidence: float = 0.40,
         contracts: int = 1,
         device: str | None = None,
     ) -> None:
