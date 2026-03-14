@@ -146,6 +146,10 @@ def make_features(bars: List[Bar]) -> np.ndarray:
             rsi,                                                               # 1
         ]
 
+    # Safety net: any NaN / ±Inf that slipped through (e.g. a zero-price bar,
+    # floating-point near-zero denominator) would silently corrupt every
+    # downstream gradient.  Replace with 0 so the bar is effectively "unseen".
+    np.nan_to_num(out, nan=0.0, posinf=0.0, neginf=0.0, copy=False)
     return out
 
 

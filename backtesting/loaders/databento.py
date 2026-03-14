@@ -115,6 +115,19 @@ def _dbn_store_to_feed(
         .reset_index(drop=True)
     )
 
+    # Drop bars with zero or negative prices — these occur in raw exchange feeds
+    # (e.g. placeholder / settlement bars) and produce NaN / -inf features that
+    # silently corrupt model training.
+    ohlc_cols = ["open", "high", "low", "close"]
+    bad_mask = df[ohlc_cols].le(0).any(axis=1) | df[ohlc_cols].isna().any(axis=1)
+    if bad_mask.any():
+        import warnings
+        warnings.warn(
+            f"Dropped {bad_mask.sum()} bar(s) with zero/negative/NaN OHLC values.",
+            stacklevel=3,
+        )
+        df = df[~bad_mask].reset_index(drop=True)
+
     return DataFeed.from_dataframe(
         df,
         symbol=symbol,
