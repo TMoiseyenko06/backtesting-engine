@@ -1,6 +1,6 @@
 """
-NQ LSTM — Train on 80 %, Backtest on 20 %
-==========================================
+NQ LSTM — Train on all data except last year, Backtest on last 1 year
+======================================================================
 
 Usage
 -----
@@ -122,8 +122,10 @@ def _print_data_section(path: str, bars: list, split: int) -> None:
     print(_kv("File :",   Path(path).name))
     print(_kv("Bars :",   f"{total:,}  ({bars[0].timestamp.strftime('%Y-%m-%d')} "
                            f"→ {bars[-1].timestamp.strftime('%Y-%m-%d')})"))
-    print(_kv("Train :",  f"{t_bars:,} bars  (80%)  {t_start} → {t_end}"))
-    print(_kv("Test  :",  f"{b_bars:,} bars  (20%)  {b_start} → {b_end}"))
+    pct_train = 100.0 * t_bars / (t_bars + b_bars)
+    pct_test  = 100.0 * b_bars / (t_bars + b_bars)
+    print(_kv("Train :",  f"{t_bars:,} bars  ({pct_train:.1f}%)  {t_start} → {t_end}"))
+    print(_kv("Test  :",  f"{b_bars:,} bars  ({pct_test:.1f}%)  {b_start} → {b_end}  [last 1 year]"))
     print()
 
 
@@ -153,7 +155,7 @@ def _print_backtest_section(analytics, symbol: str, test_bars: int,
     a = analytics
     print(_banner(
         f"BACKTEST RESULTS — {symbol} LSTM Signal  ·  "
-        f"20% out-of-sample  ({b_start} → {b_end})"
+        f"last 1 year  ({b_start} → {b_end})"
     ))
     print(f"  {'Bars tested':<24}: {test_bars:>10,}")
     print(_rule())
@@ -226,7 +228,7 @@ def main() -> None:
     device = device_info["device"]
 
     print()
-    print(_banner(f"NQ LSTM  ·  DATABENTO OHLCV-1m  ·  TRAIN 80% / BACKTEST 20%"))
+    print(_banner(f"NQ LSTM  ·  DATABENTO OHLCV-1m  ·  TRAIN ALL  /  BACKTEST LAST 1 YEAR"))
     print()
     _print_device_section(device_info)
 
@@ -240,8 +242,10 @@ def main() -> None:
     bars: List = feed_all._bars
     print(f"  Loaded {len(bars):,} bars.\n")
 
-    # ── 3. 80 / 20 split ──────────────────────────────────────────────────
-    split = int(len(bars) * 0.80)
+    # ── 3. Split: train = everything before last 1 year ───────────────────
+    from datetime import timedelta
+    cutoff = bars[-1].timestamp - timedelta(days=365)
+    split = next(i for i, b in enumerate(bars) if b.timestamp >= cutoff)
     train_bars = bars[:split]
     test_bars  = bars[split:]
 
