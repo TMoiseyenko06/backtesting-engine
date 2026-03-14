@@ -1,11 +1,16 @@
 """
 Databento data loader — ohlcv-1m schema
 -----------------------------------------
-Provides actual CME futures data (NQ, ES, CL, GC, …) with full history.
-Pay-per-query pricing — a full year of NQ 1m bars costs roughly $1–3.
+Supports two workflows:
+
+1. **Batch file** (recommended) — download once from the Databento web UI,
+   load the local .dbn / .dbn.zstd file.  No API key needed at runtime.
+
+2. **Live API** — stream directly from the Databento Historical API.
+   Pay-per-query; charged on download.
 
 Install  : pip install databento
-Sign up  : https://databento.com  (free account, pay only for what you download)
+Sign up  : https://databento.com
 API docs : https://docs.databento.com/api-reference-historical/timeseries/timeseries-get-range
 
 Dataset  : GLBX.MDP3  (CME Globex — covers NQ, ES, CL, GC, ZN, …)
@@ -19,8 +24,19 @@ Continuous-front-month symbols
   GC.c.0   Gold futures        (multiplier = 100)
   ZN.c.0   10-Year Note        (multiplier = 1000)
 
-Usage
------
+Usage — batch file
+------------------
+    from backtesting.loaders.databento import from_databento_file
+
+    feed = from_databento_file(
+        path="glbx-mdp3-20210313-20260313.ohlcv-1m.dbn.zstd",
+        symbol="NQ",              # label for Bar objects
+        contract_multiplier=20.0,
+        warmup_bars=20,
+    )
+
+Usage — live API
+----------------
     from backtesting.loaders.databento import from_databento
 
     feed = from_databento(
@@ -35,7 +51,8 @@ Usage
 
 from __future__ import annotations
 
-from typing import Optional
+from pathlib import Path
+from typing import Optional, Union
 
 from backtesting.data_feed import DataFeed
 
@@ -43,6 +60,107 @@ from backtesting.data_feed import DataFeed
 # CME Globex dataset — covers all CME/CBOT/NYMEX/COMEX futures
 _DATASET = "GLBX.MDP3"
 _SCHEMA = "ohlcv-1m"
+
+
+# ---------------------------------------------------------------------------
+# Internal helper
+# ---------------------------------------------------------------------------
+
+def _dbn_store_to_feed(
+    store,
+    symbol: str,
+    contract_multiplier: float,
+    warmup_bars: int,
+) -> DataFeed:
+    """Convert a databento.DBNStore to a DataFeed."""
+    import pandas as pd
+
+    df = store.to_df()
+
+    if df.empty:
+        raise ValueError("Databento returned an empty DataFrame.")
+
+    # ts_event is the nanosecond-resolution bar-close timestamp and is the
+    # index after to_df(); reset so we can rename it uniformly.
+    df = df.reset_index()
+
+    ts_col = next(
+        (c for c in df.columns if c == "ts_event" or "timestamp" in c.lower()),
+        None,
+    )
+    if ts_col is None:
+        raise ValueError(
+            f"Could not find a timestamp column. Columns: {list(df.columns)}"
+        )
+    df = df.rename(columns={ts_col: "timestamp"})
+
+    missing = [c for c in ("open", "high", "low", "close", "volume") if c not in df.columns]
+    if missing:
+        raise ValueError(
+            f"DataFrame is missing expected columns: {missing}. "
+            f"Available: {list(df.columns)}"
+        )
+
+    df["timestamp"] = pd.to_datetime(df["timestamp"])
+    if hasattr(df["timestamp"].dtype, "tz") and df["timestamp"].dt.tz is not None:
+        df["timestamp"] = df["timestamp"].dt.tz_localize(None)
+
+    return DataFeed.from_dataframe(
+        df[["timestamp", "open", "high", "low", "close", "volume"]],
+        symbol=symbol,
+        contract_multiplier=contract_multiplier,
+        warmup_bars=warmup_bars,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Public loaders
+# ---------------------------------------------------------------------------
+
+def from_databento_file(
+    path: Union[str, Path],
+    symbol: str,
+    contract_multiplier: float = 1.0,
+    warmup_bars: int = 0,
+) -> DataFeed:
+    """
+    Load ohlcv-1m bars from a local Databento batch-download file and return
+    a DataFeed.
+
+    Supports ``.dbn``, ``.dbn.zstd``, and ``.dbn.zst`` files produced by the
+    Databento web UI or ``databento-cli``.
+
+    Parameters
+    ----------
+    path : str | Path
+        Path to the ``.dbn`` or ``.dbn.zstd`` file.
+    symbol : str
+        Symbol name to store in each Bar, e.g. ``"NQ"``.
+    contract_multiplier : float
+        Futures contract size ($ per point), e.g. ``20.0`` for NQ.
+    warmup_bars : int
+        Silent warm-up bars before strategies receive on_bar() calls.
+
+    Returns
+    -------
+    DataFeed
+
+    Examples
+    --------
+    >>> feed = from_databento_file(
+    ...     path="glbx-mdp3-20210313-20260313.ohlcv-1m.dbn.zstd",
+    ...     symbol="NQ",
+    ...     contract_multiplier=20.0,
+    ...     warmup_bars=20,
+    ... )
+    """
+    try:
+        import databento as db
+    except ImportError:
+        raise ImportError("databento is not installed. Run: pip install databento")
+
+    store = db.DBNStore.from_file(str(path))
+    return _dbn_store_to_feed(store, symbol, contract_multiplier, warmup_bars)
 
 
 def from_databento(
@@ -56,7 +174,8 @@ def from_databento(
     bar_symbol: Optional[str] = None,
 ) -> DataFeed:
     """
-    Fetch ohlcv-1m bars from Databento and return a DataFeed.
+    Fetch ohlcv-1m bars from the Databento Historical API and return a
+    DataFeed.  Charges apply on each download.
 
     Parameters
     ----------
@@ -75,8 +194,8 @@ def from_databento(
     dataset : str
         Databento dataset ID. Defaults to ``"GLBX.MDP3"`` (CME Globex).
     bar_symbol : str | None
-        Override the symbol name stored in each Bar. Defaults to ``symbol``
-        with the ``.c.0`` suffix stripped, e.g. ``"NQ.c.0"`` → ``"NQ"``.
+        Override the symbol name stored in each Bar. Defaults to the root
+        of ``symbol`` — e.g. ``"NQ.c.0"`` → ``"NQ"``.
 
     Returns
     -------
@@ -95,15 +214,10 @@ def from_databento(
     try:
         import databento as db
     except ImportError:
-        raise ImportError(
-            "databento is not installed. Run: pip install databento"
-        )
-
-    import pandas as pd
+        raise ImportError("databento is not installed. Run: pip install databento")
 
     client = db.Historical(api_key)
-
-    data = client.timeseries.get_range(
+    store = client.timeseries.get_range(
         dataset=dataset,
         symbols=[symbol],
         schema=_SCHEMA,
@@ -111,47 +225,5 @@ def from_databento(
         end=end,
     )
 
-    df = data.to_df()
-
-    if df.empty:
-        raise ValueError(
-            f"Databento returned no data for {symbol} "
-            f"({dataset} / {_SCHEMA}) {start} → {end}. "
-            "Check your symbol, date range, and API key."
-        )
-
-    # ts_event is a nanosecond timestamp index; move to column
-    df = df.reset_index()
-    ts_col = next(
-        (c for c in df.columns if "ts_event" in c or "timestamp" in c.lower()),
-        None,
-    )
-    if ts_col is None:
-        raise ValueError(
-            f"Could not find a timestamp column in Databento DataFrame. "
-            f"Columns: {list(df.columns)}"
-        )
-    df = df.rename(columns={ts_col: "timestamp"})
-
-    # Ensure expected OHLCV columns exist
-    missing = [c for c in ("open", "high", "low", "close", "volume") if c not in df.columns]
-    if missing:
-        raise ValueError(
-            f"Databento DataFrame is missing columns: {missing}. "
-            f"Available: {list(df.columns)}"
-        )
-
-    df["timestamp"] = pd.to_datetime(df["timestamp"])
-    if hasattr(df["timestamp"].dtype, "tz") and df["timestamp"].dt.tz is not None:
-        df["timestamp"] = df["timestamp"].dt.tz_localize(None)
-
-    # Default bar symbol: strip ".c.0" suffix from continuous symbol
-    if bar_symbol is None:
-        bar_symbol = symbol.split(".")[0]
-
-    return DataFeed.from_dataframe(
-        df[["timestamp", "open", "high", "low", "close", "volume"]],
-        symbol=bar_symbol,
-        contract_multiplier=contract_multiplier,
-        warmup_bars=warmup_bars,
-    )
+    resolved_symbol = bar_symbol or symbol.split(".")[0]
+    return _dbn_store_to_feed(store, resolved_symbol, contract_multiplier, warmup_bars)
