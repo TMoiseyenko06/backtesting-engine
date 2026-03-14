@@ -105,8 +105,18 @@ def _dbn_store_to_feed(
     if hasattr(df["timestamp"].dtype, "tz") and df["timestamp"].dt.tz is not None:
         df["timestamp"] = df["timestamp"].dt.tz_localize(None)
 
+    # The file may contain multiple instrument IDs (e.g. two contract expiries)
+    # sharing the same timestamp.  Keep the row with the highest volume so we
+    # follow the dominant/front-month contract at each bar.
+    df = (
+        df[["timestamp", "open", "high", "low", "close", "volume"]]
+        .sort_values(["timestamp", "volume"])
+        .drop_duplicates(subset=["timestamp"], keep="last")
+        .reset_index(drop=True)
+    )
+
     return DataFeed.from_dataframe(
-        df[["timestamp", "open", "high", "low", "close", "volume"]],
+        df,
         symbol=symbol,
         contract_multiplier=contract_multiplier,
         warmup_bars=warmup_bars,
