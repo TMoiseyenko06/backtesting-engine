@@ -53,7 +53,7 @@ from torch.utils.data import DataLoader, TensorDataset
 
 from backtesting.data_feed import Bar
 from backtesting.ml.actor_critic import ActorCriticLSTM
-from backtesting.ml.rl_env import TradingEnv
+from backtesting.ml.rl_env import BatchedTradingEnv, TradingEnv
 from backtesting.ml.model import _auto_device
 
 
@@ -290,135 +290,135 @@ class PPOTrainer:
         """
         Sample ``rollout_days`` episodes and collect trajectories.
 
-        All active episodes are stepped in lock-step so their observations
-        can be batched into a single GPU forward pass at every bar — this
-        keeps both H200s busy during inference instead of issuing one
-        batch-1 call per bar per episode.
+        Uses BatchedTradingEnv so all active episodes are stepped with a
+        single numpy call instead of a Python loop — this removes the CPU
+        bottleneck that kept the GPU idle between forward passes.
         """
         self._policy.eval()
 
-        sampled  = random.choices(episodes, k=self.rollout_days)
-        n_ep     = len(sampled)
+        sampled = random.choices(episodes, k=self.rollout_days)
+        n_ep    = len(sampled)
 
-        # One independent env per episode
-        envs     = [TradingEnv(**self._env_kwargs) for _ in range(n_ep)]
-        states   = [env.reset(feat, prices)
-                    for env, (feat, prices, _) in zip(envs, sampled)]
-        cursors  = [self.seq_len] * n_ep   # index into fwd_returns
-        ep_rets  = [0.0] * n_ep
-        active   = list(range(n_ep))       # episode indices still running
+        # Pre-compute forward-return matrix for vectorised lookup (no Python
+        # loop inside the hot path)
+        max_bars = max(len(f) for f, _, _ in sampled)
+        fwd_arr  = np.zeros((n_ep, max_bars), dtype=np.float32)
+        for i, (_, _, fwd) in enumerate(sampled):
+            fwd_arr[i, :len(fwd)] = fwd
 
-        # Per-episode experience buffers
-        ep_bufs  = [{"obs": [], "actions": [], "log_probs": [],
-                     "values": [], "rewards": [], "dones": [],
-                     "actual_fwd_rets": [], "pred_fwd_rets": []}
-                    for _ in range(n_ep)]
+        # Single vectorised env — replaces n_ep × TradingEnv objects
+        env        = BatchedTradingEnv(n_envs=n_ep, **self._env_kwargs)
+        all_states = env.reset_all(sampled)              # (n_ep, seq, state_dim)
 
-        # GPU tensors accumulated across rollout steps; moved to CPU
-        # in a single bulk transfer after the loop finishes.
-        # This replaces O(steps × episodes) .item() syncs with O(steps)
-        # syncs for actions (needed to call env.step) + 3 syncs total for
-        # the scalar outputs at the end.
-        gpu_log_probs: list[torch.Tensor] = []
-        gpu_values:    list[torch.Tensor] = []
-        gpu_pred_rets: list[torch.Tensor] = []
-        active_history: list[list[int]]  = []
+        active_mask = np.ones(n_ep, dtype=bool)
+        ep_rets     = np.zeros(n_ep, dtype=np.float32)
+        cursors     = np.full(n_ep, self.seq_len, dtype=np.int32)
+
+        # Per-episode buffers (episode order preserves GAE episode boundaries)
+        ep_bufs = [{"obs": [], "actions": [], "rewards": [], "dones": [],
+                    "actual_fwd_rets": []}
+                   for _ in range(n_ep)]
+
+        # GPU scalar outputs accumulated and bulk-transferred after the loop
+        gpu_log_probs : list[torch.Tensor] = []
+        gpu_values    : list[torch.Tensor] = []
+        gpu_pred_rets : list[torch.Tensor] = []
+        active_hist   : list[np.ndarray]   = []
 
         with torch.no_grad():
-            while active:
-                # ── Batch all active states into one GPU call ──────────
-                x = torch.tensor(
-                    np.stack([states[i] for i in active]),
-                    dtype=torch.float32,
-                ).to(self.device)           # (n_active, seq_len, n_feat)
+            while active_mask.any():
+                active = np.where(active_mask)[0]        # active episode indices
+                curr   = all_states[active]              # (n_active, seq, state_dim)
 
+                # ── GPU forward: one batched call for all active episodes ──
+                x = torch.from_numpy(curr).to(self.device)
                 logits, values_t, pred_rets = self._policy(x)
-                dist     = torch.distributions.Categorical(logits=logits)
-                actions  = dist.sample()
-                log_prob = dist.log_prob(actions)
+                dist       = torch.distributions.Categorical(logits=logits)
+                actions_t  = dist.sample()
+                log_prob   = dist.log_prob(actions_t)
 
-                # Store GPU tensors — no .item() yet
                 gpu_log_probs.append(log_prob)
                 gpu_values.append(values_t)
                 gpu_pred_rets.append(pred_rets)
-                active_history.append(list(active))
+                active_hist.append(active)
 
-                # ONE sync per step (not per episode) to feed env.step
-                actions_np = actions.cpu().numpy()
+                # ONE sync per step — only actions need to reach CPU
+                actions_np = actions_t.cpu().numpy()     # (n_active,)
 
-                next_active = []
+                # ── Light per-episode bookkeeping (list appends only) ──
                 for j, i in enumerate(active):
-                    _, _, fwd_returns = sampled[i]
-                    action = int(actions_np[j])
-
-                    next_state, reward, done = envs[i].step(action)
-                    ep_rets[i] += reward
-
-                    buf = ep_bufs[i]
-                    buf["obs"].append(states[i])
-                    buf["actions"].append(action)
-                    buf["rewards"].append(reward)
-                    buf["dones"].append(done)
+                    ep_bufs[i]["obs"].append(curr[j])
+                    ep_bufs[i]["actions"].append(int(actions_np[j]))
                     c = cursors[i]
-                    buf["actual_fwd_rets"].append(
-                        float(fwd_returns[c]) if c < len(fwd_returns) else 0.0
+                    ep_bufs[i]["actual_fwd_rets"].append(
+                        float(fwd_arr[i, c]) if c < fwd_arr.shape[1] else 0.0
                     )
 
-                    cursors[i] += 1
-                    states[i]   = next_state
-                    if not done:
-                        next_active.append(i)
+                cursors[active] += 1
 
-                active = next_active
+                # ── Vectorised env step: one numpy call instead of n_active
+                #    Python calls — this is the key CPU bottleneck fix ──────
+                actions_all              = np.zeros(n_ep, dtype=np.int64)
+                actions_all[active]      = actions_np
+                all_states, rews, dones  = env.step_all(actions_all)
 
-        # ── Bulk GPU→CPU transfer (3 syncs total for entire rollout) ──
-        all_lp  = torch.cat(gpu_log_probs).cpu().numpy()
-        all_v   = torch.cat(gpu_values).cpu().numpy()
-        all_pr  = torch.cat(gpu_pred_rets).cpu().numpy()
+                for j, i in enumerate(active):
+                    ep_bufs[i]["rewards"].append(float(rews[i]))
+                    ep_bufs[i]["dones"].append(bool(dones[i]))
+                    ep_rets[i] += float(rews[i])
+
+                active_mask &= ~dones
+
+        # ── Bulk GPU→CPU: 3 syncs total for the entire rollout ──────────
+        all_lp = torch.cat(gpu_log_probs).cpu().numpy()
+        all_v  = torch.cat(gpu_values).cpu().numpy()
+        all_pr = torch.cat(gpu_pred_rets).cpu().numpy()
 
         offset = 0
-        for active_at_step in active_history:
+        for active_at_step in active_hist:
             n = len(active_at_step)
             for j, i in enumerate(active_at_step):
-                ep_bufs[i]["log_probs"].append(float(all_lp[offset + j]))
-                ep_bufs[i]["values"].append(float(all_v[offset + j]))
-                ep_bufs[i]["pred_fwd_rets"].append(float(all_pr[offset + j]))
+                ep_bufs[i].setdefault("log_probs",    []).append(float(all_lp[offset + j]))
+                ep_bufs[i].setdefault("values",       []).append(float(all_v [offset + j]))
+                ep_bufs[i].setdefault("pred_fwd_rets",[]).append(float(all_pr[offset + j]))
             offset += n
 
-        # ── Merge all episode buffers ──────────────────────────────────
+        # ── Merge per-episode buffers (episode order → correct GAE) ─────
+        obs_buf = actions_buf = log_prob_buf = value_buf = []
+        reward_buf = done_buf = fwd_buf = pred_buf = []
+
         obs_buf            = []
-        action_buf         = []
+        actions_buf        = []
         log_prob_buf       = []
         value_buf          = []
         reward_buf         = []
         done_buf           = []
-        actual_fwd_ret_buf = []
-        pred_fwd_ret_buf   = []
+        fwd_buf            = []
+        pred_buf           = []
 
         for buf in ep_bufs:
             obs_buf.extend(buf["obs"])
-            action_buf.extend(buf["actions"])
+            actions_buf.extend(buf["actions"])
             log_prob_buf.extend(buf["log_probs"])
             value_buf.extend(buf["values"])
             reward_buf.extend(buf["rewards"])
             done_buf.extend(buf["dones"])
-            actual_fwd_ret_buf.extend(buf["actual_fwd_rets"])
-            pred_fwd_ret_buf.extend(buf["pred_fwd_rets"])
+            fwd_buf.extend(buf["actual_fwd_rets"])
+            pred_buf.extend(buf["pred_fwd_rets"])
 
-        pred_errors = np.abs(
-            np.array(pred_fwd_ret_buf) - np.array(actual_fwd_ret_buf)
-        )
+        fwd_np  = np.array(fwd_buf,  dtype=np.float32)
+        pred_np = np.array(pred_buf, dtype=np.float32)
 
         return {
-            "obs":                np.array(obs_buf,            dtype=np.float32),
-            "actions":            np.array(action_buf,         dtype=np.int64),
-            "log_probs":          np.array(log_prob_buf,       dtype=np.float32),
-            "values":             np.array(value_buf,          dtype=np.float32),
-            "rewards":            np.array(reward_buf,         dtype=np.float32),
-            "dones":              np.array(done_buf,           dtype=bool),
-            "actual_fwd_rets":    np.array(actual_fwd_ret_buf, dtype=np.float32),
-            "episode_returns":    ep_rets,
-            "pred_return_errors": pred_errors,
+            "obs":                np.array(obs_buf,      dtype=np.float32),
+            "actions":            np.array(actions_buf,  dtype=np.int64),
+            "log_probs":          np.array(log_prob_buf, dtype=np.float32),
+            "values":             np.array(value_buf,    dtype=np.float32),
+            "rewards":            np.array(reward_buf,   dtype=np.float32),
+            "dones":              np.array(done_buf,     dtype=bool),
+            "actual_fwd_rets":    fwd_np,
+            "episode_returns":    ep_rets.tolist(),
+            "pred_return_errors": np.abs(pred_np - fwd_np),
         }
 
     # ------------------------------------------------------------------

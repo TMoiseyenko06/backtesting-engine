@@ -216,3 +216,177 @@ class TradingEnv:
             (last_price - self._entry_price)
             * self._position * self.contracts * self.multiplier
         )
+
+
+class BatchedTradingEnv:
+    """
+    Vectorised equivalent of running n_envs TradingEnv instances in parallel.
+
+    Instead of calling env.step() in a Python loop (512 calls × 400 bars =
+    200K Python dispatches per rollout iteration), all environments are
+    stepped simultaneously using numpy array operations.  This removes the
+    CPU-side bottleneck that keeps the GPU idle between forward passes.
+
+    API mirrors TradingEnv but operates on all n_envs at once:
+        states = env.reset_all(episodes)          # (n, seq_len, state_dim)
+        states, rewards, dones = env.step_all(actions)  # all numpy, no loops
+    """
+
+    def __init__(
+        self,
+        n_envs:       int,
+        seq_len:      int   = 30,
+        n_features:   int   = 22,
+        multiplier:   float = 20.0,
+        commission:   float = 2.0,
+        contracts:    float = 1.0,
+        max_loss:     float = 2_500.0,
+        reward_scale: float = 100.0,
+    ) -> None:
+        self.n_envs       = n_envs
+        self.seq_len      = seq_len
+        self.n_features   = n_features
+        self.state_dim    = n_features + TradingEnv.N_EXTRA
+        self.multiplier   = multiplier
+        self.commission   = commission
+        self.contracts    = contracts
+        self.max_loss     = max_loss
+        self.reward_scale = reward_scale
+
+        # Allocated in reset_all
+        self._features     : np.ndarray | None = None  # (n, max_bars, n_features)
+        self._prices       : np.ndarray | None = None  # (n, max_bars)
+        self._lengths      : np.ndarray | None = None  # (n,) int32
+        self._cursors      : np.ndarray | None = None  # (n,) int32
+        self._positions    : np.ndarray | None = None  # (n,) int32
+        self._entry_prices : np.ndarray | None = None  # (n,) float32
+        self._prev_closes  : np.ndarray | None = None  # (n,) float32
+        self._ei           : np.ndarray | None = None  # np.arange(n), cached
+
+    # ------------------------------------------------------------------
+
+    def reset_all(
+        self,
+        episodes: list[tuple[np.ndarray, np.ndarray, np.ndarray]],
+    ) -> np.ndarray:
+        """
+        episodes : list of (features, prices, fwd_returns) of length n_envs
+        Returns  : initial states (n_envs, seq_len, state_dim)
+        """
+        n        = self.n_envs
+        max_bars = max(len(f) for f, _, _ in episodes)
+
+        self._features = np.zeros((n, max_bars, self.n_features), dtype=np.float32)
+        self._prices   = np.zeros((n, max_bars),                   dtype=np.float32)
+        self._lengths  = np.empty(n, dtype=np.int32)
+
+        for i, (feat, prices, _) in enumerate(episodes):
+            L = len(feat)
+            self._features[i, :L] = feat.astype(np.float32)
+            self._prices  [i, :L] = prices.astype(np.float32)
+            self._lengths [i]     = L
+
+        self._ei           = np.arange(n)
+        self._cursors      = np.full(n, self.seq_len, dtype=np.int32)
+        self._positions    = np.zeros(n, dtype=np.int32)
+        self._entry_prices = np.zeros(n, dtype=np.float32)
+        self._prev_closes  = self._prices[self._ei, self.seq_len - 1]
+        return self._build_states()
+
+    # ------------------------------------------------------------------
+
+    def step_all(
+        self, actions: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        """
+        actions : (n_envs,) int array — {0 FLAT, 1 LONG, 2 SHORT}
+        Returns : states (n, seq_len, state_dim), rewards (n,), dones (n,)
+        """
+        ei          = self._ei
+        curr_closes = self._prices[ei, self._cursors]                     # (n,)
+
+        # Map action integers to signed positions vectorially
+        desired = np.where(actions == 1, np.int32(1),
+                  np.where(actions == 2, np.int32(-1), np.int32(0)))
+
+        # ── Trade execution (mirrors TradingEnv.step order exactly) ───
+        trade      = desired != self._positions
+        close_cost = (self._positions != 0) & trade
+        open_cost  = (desired != 0)         & trade
+        commission = (
+            (close_cost.astype(np.float32) + open_cost.astype(np.float32))
+            * self.commission * self.contracts
+        )
+
+        # Positions and entry prices are updated BEFORE MTM — TradingEnv
+        # updates self._position before computing mtm, so a newly opened
+        # position receives credit for the current bar's price move.
+        new_pos   = np.where(trade, desired, self._positions)
+        new_entry = np.where(
+            trade & (desired != 0), curr_closes,
+            np.where(trade & (desired == 0), np.float32(0.0), self._entry_prices),
+        )
+
+        # MTM uses the NEW (post-trade) position
+        mtm     = ((curr_closes - self._prev_closes)
+                   * new_pos * self.contracts * self.multiplier)
+        rewards = (mtm - commission) / self.reward_scale
+
+        # Per-trade stop-loss — also evaluated on the NEW position / entry
+        has_pos = (new_pos != 0) & (new_entry > 0.0)
+        upnl    = (curr_closes - new_entry) * new_pos * self.contracts * self.multiplier
+        stopped = has_pos & (upnl < -self.max_loss)
+        rewards  -= stopped.astype(np.float32) * self.commission * self.contracts / self.reward_scale
+        new_pos   = np.where(stopped, np.int32(0),     new_pos)
+        new_entry = np.where(stopped, np.float32(0.0), new_entry)
+
+        self._positions    = new_pos
+        self._entry_prices = new_entry
+        self._prev_closes  = curr_closes
+        self._cursors     += 1
+
+        # End-of-episode forced flat
+        dones   = self._cursors >= self._lengths
+        eod_pos = dones & (self._positions != 0)
+        rewards -= eod_pos.astype(np.float32) * self.commission * self.contracts / self.reward_scale
+        self._positions    = np.where(dones, np.int32(0),     self._positions)
+        self._entry_prices = np.where(dones, np.float32(0.0), self._entry_prices)
+
+        return self._build_states(), rewards.astype(np.float32), dones
+
+    # ------------------------------------------------------------------
+
+    def _build_states(self) -> np.ndarray:
+        """
+        Build (n_envs, seq_len, state_dim) for all envs with one numpy call.
+        Uses advanced integer indexing — zero Python loops.
+        """
+        ei  = self._ei                              # (n,)
+        c   = self._cursors                         # (n,)
+        j   = np.arange(self.seq_len)               # (seq_len,)
+
+        # Time indices into the padded features array
+        t_idx = (c[:, None] - self.seq_len) + j     # (n, seq_len)
+        # Clamp: envs that have run past their episode end reuse last valid bar
+        t_idx = np.clip(t_idx, 0, self._features.shape[1] - 1)
+
+        seq = self._features[ei[:, None], t_idx, :] # (n, seq_len, n_features)
+
+        # Position encoding: broadcast scalar per env across the seq window
+        pos_enc = (self._positions.astype(np.float32)[:, None, None]
+                   * np.ones((1, self.seq_len, 1), dtype=np.float32))
+
+        # Unrealised P&L encoding
+        prev_p   = self._prices[ei, np.maximum(c - 1, 0)]
+        upnl_raw = np.where(
+            (self._positions != 0) & (self._entry_prices > 0.0),
+            ((prev_p - self._entry_prices)
+             * self._positions * self.contracts * self.multiplier
+             / self.reward_scale),
+            np.float32(0.0),
+        ).astype(np.float32)
+        upnl_raw = np.clip(upnl_raw, -10.0, 10.0)
+        upnl_arr = (upnl_raw[:, None, None]
+                    * np.ones((1, self.seq_len, 1), dtype=np.float32))
+
+        return np.concatenate([seq, pos_enc, upnl_arr], axis=-1)  # (n, seq_len, state_dim)
