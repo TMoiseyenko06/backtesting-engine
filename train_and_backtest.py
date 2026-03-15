@@ -103,7 +103,7 @@ def _print_device_section(info: dict) -> None:
         print(_kv("GPU :", f"{gpu_label}NVIDIA {info['name']}  "
                            f"({vram} GB VRAM each  ·  {vram * n:.0f} GB total)"))
         print(_kv("",      f"CUDA {info['cuda_version']}  ·  Compute {cap}  "
-                           f"·  PyTorch {info['torch_version']}  ·  BF16 AMP"))
+                           f"·  PyTorch {info['torch_version']}  ·  TF32"))
     elif info["device"] == "mps":
         print(_section("DEVICE"))
         print(_kv("GPU :", f"Apple MPS  ·  PyTorch {info['torch_version']}"))

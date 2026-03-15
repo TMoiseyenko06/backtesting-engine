@@ -68,9 +68,11 @@ class Trainer:
         self.num_workers  = num_workers
         self.device       = device or _auto_device()
 
-        # ── AMP: use BF16 on CUDA (H200 / Ampere+ have native BF16 tensor cores)
-        self._use_amp  = (self.device == "cuda")
-        self._amp_dtype = torch.bfloat16
+        # H200 / Ampere+ automatically use TF32 for matmul/cuDNN (PyTorch default).
+        # BF16 autocast causes NaN in LSTM hidden states due to 7-bit mantissa
+        # precision loss in sequential updates — disabled in favour of TF32.
+        self._use_amp   = False
+        self._amp_dtype = torch.bfloat16  # unused, kept for future opt-in
 
         base_model = LSTMModel(
             n_features=n_features,
