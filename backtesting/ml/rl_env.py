@@ -4,7 +4,7 @@ Intraday futures trading environment for PPO.
 One episode = all bars for a single UTC calendar date.  The env steps through
 bars one at a time and enforces:
   - Intraday-only (EOD forced-flat at episode end)
-  - Per-trade stop-loss (force flat when unrealised P&L < -max_loss)
+  - Trailing drawdown stop (force flat when unrealised P&L drops $max_loss from its peak)
 
 State
 -----
@@ -75,13 +75,14 @@ class TradingEnv:
         self.reward_scale = reward_scale
 
         # Episode state (initialised by reset)
-        self._features:    np.ndarray | None = None
-        self._prices:      np.ndarray | None = None
-        self._n:           int   = 0
-        self._cursor:      int   = 0
-        self._position:    int   = 0      # −1, 0, +1
-        self._entry_price: float = 0.0
-        self._prev_close:  float = 0.0
+        self._features:       np.ndarray | None = None
+        self._prices:         np.ndarray | None = None
+        self._n:              int   = 0
+        self._cursor:         int   = 0
+        self._position:       int   = 0      # −1, 0, +1
+        self._entry_price:    float = 0.0
+        self._peak_unrealised: float = 0.0
+        self._prev_close:     float = 0.0
 
     # ------------------------------------------------------------------
     # Episode lifecycle
@@ -101,13 +102,14 @@ class TradingEnv:
             raise ValueError(
                 f"episode too short ({len(features)} bars ≤ seq_len={self.seq_len})"
             )
-        self._features    = features.astype(np.float32)
-        self._prices      = prices.astype(np.float32)
-        self._n           = len(features)
-        self._cursor      = self.seq_len   # first actionable bar index
-        self._position    = 0
-        self._entry_price = 0.0
-        self._prev_close  = float(prices[self.seq_len - 1])
+        self._features        = features.astype(np.float32)
+        self._prices          = prices.astype(np.float32)
+        self._n               = len(features)
+        self._cursor          = self.seq_len   # first actionable bar index
+        self._position        = 0
+        self._entry_price     = 0.0
+        self._peak_unrealised = 0.0
+        self._prev_close      = float(prices[self.seq_len - 1])
         return self._state()
 
     def step(self, action: int) -> tuple[np.ndarray, float, bool]:
@@ -133,25 +135,30 @@ class TradingEnv:
                 commission_paid += self.commission * self.contracts
             if desired != 0:                             # open new
                 commission_paid += self.commission * self.contracts
-                self._entry_price = curr_close
+                self._entry_price     = curr_close
+                self._peak_unrealised = 0.0
             else:
-                self._entry_price = 0.0
+                self._entry_price     = 0.0
+                self._peak_unrealised = 0.0
             self._position = desired
 
         # ── Mark-to-market reward ─────────────────────────────────────────
         mtm    = (curr_close - self._prev_close) * self._position * self.contracts * self.multiplier
         reward = (mtm - commission_paid) / self.reward_scale
 
-        # ── Per-trade stop-loss ───────────────────────────────────────────
+        # ── Trailing drawdown stop ────────────────────────────────────────
         if self._position != 0 and self._entry_price > 0.0:
             upnl = (
                 (curr_close - self._entry_price)
                 * self._position * self.contracts * self.multiplier
             )
-            if upnl < -self.max_loss:
+            if upnl > self._peak_unrealised:
+                self._peak_unrealised = upnl
+            if self._peak_unrealised - upnl >= self.max_loss:
                 reward        -= (self.commission * self.contracts) / self.reward_scale
-                self._position = 0
-                self._entry_price = 0.0
+                self._position        = 0
+                self._entry_price     = 0.0
+                self._peak_unrealised = 0.0
 
         self._prev_close = curr_close
         self._cursor    += 1
@@ -254,14 +261,15 @@ class BatchedTradingEnv:
         self.reward_scale = reward_scale
 
         # Allocated in reset_all
-        self._features     : np.ndarray | None = None  # (n, max_bars, n_features)
-        self._prices       : np.ndarray | None = None  # (n, max_bars)
-        self._lengths      : np.ndarray | None = None  # (n,) int32
-        self._cursors      : np.ndarray | None = None  # (n,) int32
-        self._positions    : np.ndarray | None = None  # (n,) int32
-        self._entry_prices : np.ndarray | None = None  # (n,) float32
-        self._prev_closes  : np.ndarray | None = None  # (n,) float32
-        self._ei           : np.ndarray | None = None  # np.arange(n), cached
+        self._features        : np.ndarray | None = None  # (n, max_bars, n_features)
+        self._prices          : np.ndarray | None = None  # (n, max_bars)
+        self._lengths         : np.ndarray | None = None  # (n,) int32
+        self._cursors         : np.ndarray | None = None  # (n,) int32
+        self._positions       : np.ndarray | None = None  # (n,) int32
+        self._entry_prices    : np.ndarray | None = None  # (n,) float32
+        self._peak_unrealised : np.ndarray | None = None  # (n,) float32
+        self._prev_closes     : np.ndarray | None = None  # (n,) float32
+        self._ei              : np.ndarray | None = None  # np.arange(n), cached
 
     # ------------------------------------------------------------------
 
@@ -286,11 +294,12 @@ class BatchedTradingEnv:
             self._prices  [i, :L] = prices.astype(np.float32)
             self._lengths [i]     = L
 
-        self._ei           = np.arange(n)
-        self._cursors      = np.full(n, self.seq_len, dtype=np.int32)
-        self._positions    = np.zeros(n, dtype=np.int32)
-        self._entry_prices = np.zeros(n, dtype=np.float32)
-        self._prev_closes  = self._prices[self._ei, self.seq_len - 1]
+        self._ei              = np.arange(n)
+        self._cursors         = np.full(n, self.seq_len, dtype=np.int32)
+        self._positions       = np.zeros(n, dtype=np.int32)
+        self._entry_prices    = np.zeros(n, dtype=np.float32)
+        self._peak_unrealised = np.zeros(n, dtype=np.float32)
+        self._prev_closes     = self._prices[self._ei, self.seq_len - 1]
         return self._build_states()
 
     # ------------------------------------------------------------------
@@ -326,22 +335,27 @@ class BatchedTradingEnv:
             trade & (desired != 0), curr_closes,
             np.where(trade & (desired == 0), np.float32(0.0), self._entry_prices),
         )
+        # Reset peak when a trade opens or closes
+        new_peak = np.where(trade, np.float32(0.0), self._peak_unrealised)
 
         # MTM uses the NEW (post-trade) position
         mtm     = ((curr_closes - self._prev_closes)
                    * new_pos * self.contracts * self.multiplier)
         rewards = (mtm - commission) / self.reward_scale
 
-        # Per-trade stop-loss — also evaluated on the NEW position / entry
-        has_pos = (new_pos != 0) & (new_entry > 0.0)
-        upnl    = (curr_closes - new_entry) * new_pos * self.contracts * self.multiplier
-        stopped = has_pos & (upnl < -self.max_loss)
+        # Trailing drawdown stop — evaluated on NEW position / entry
+        has_pos  = (new_pos != 0) & (new_entry > 0.0)
+        upnl     = (curr_closes - new_entry) * new_pos * self.contracts * self.multiplier
+        new_peak = np.where(has_pos & (upnl > new_peak), upnl, new_peak)
+        stopped  = has_pos & ((new_peak - upnl) >= self.max_loss)
         rewards  -= stopped.astype(np.float32) * self.commission * self.contracts / self.reward_scale
         new_pos   = np.where(stopped, np.int32(0),     new_pos)
         new_entry = np.where(stopped, np.float32(0.0), new_entry)
+        new_peak  = np.where(stopped, np.float32(0.0), new_peak)
 
-        self._positions    = new_pos
-        self._entry_prices = new_entry
+        self._positions       = new_pos
+        self._entry_prices    = new_entry
+        self._peak_unrealised = new_peak
         self._prev_closes  = curr_closes
         self._cursors     += 1
 
@@ -349,8 +363,9 @@ class BatchedTradingEnv:
         dones   = self._cursors >= self._lengths
         eod_pos = dones & (self._positions != 0)
         rewards -= eod_pos.astype(np.float32) * self.commission * self.contracts / self.reward_scale
-        self._positions    = np.where(dones, np.int32(0),     self._positions)
-        self._entry_prices = np.where(dones, np.float32(0.0), self._entry_prices)
+        self._positions       = np.where(dones, np.int32(0),     self._positions)
+        self._entry_prices    = np.where(dones, np.float32(0.0), self._entry_prices)
+        self._peak_unrealised = np.where(dones, np.float32(0.0), self._peak_unrealised)
 
         return self._build_states(), rewards.astype(np.float32), dones
 
