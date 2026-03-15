@@ -172,6 +172,19 @@ class PPOTrainer:
         else:
             self.model = base_model
 
+        # ── H200 auto-scale: fill the GPU with larger rollout and minibatches.
+        # rollout_days controls the batch size during rollout inference (all
+        # active episodes are stacked into one forward pass per bar).  16 episodes
+        # → batch-16 calls; 512 episodes → batch-512 calls — 32× more GPU work.
+        if _is_h200:
+            self.rollout_days   = rollout_days   * 32   # 16  → 512 episodes
+            self.minibatch_size = self.minibatch_size * 8   # → 8192 effective
+            self.ppo_epochs     = ppo_epochs * 2            # 4   → 8 epochs
+            print(
+                f"  [H200] auto-scale: rollout_days={self.rollout_days}  "
+                f"minibatch={self.minibatch_size}  ppo_epochs={self.ppo_epochs}"
+            )
+
         self._policy = (
             self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         )
@@ -301,6 +314,16 @@ class PPOTrainer:
                      "actual_fwd_rets": [], "pred_fwd_rets": []}
                     for _ in range(n_ep)]
 
+        # GPU tensors accumulated across rollout steps; moved to CPU
+        # in a single bulk transfer after the loop finishes.
+        # This replaces O(steps × episodes) .item() syncs with O(steps)
+        # syncs for actions (needed to call env.step) + 3 syncs total for
+        # the scalar outputs at the end.
+        gpu_log_probs: list[torch.Tensor] = []
+        gpu_values:    list[torch.Tensor] = []
+        gpu_pred_rets: list[torch.Tensor] = []
+        active_history: list[list[int]]  = []
+
         with torch.no_grad():
             while active:
                 # ── Batch all active states into one GPU call ──────────
@@ -314,10 +337,19 @@ class PPOTrainer:
                 actions  = dist.sample()
                 log_prob = dist.log_prob(actions)
 
+                # Store GPU tensors — no .item() yet
+                gpu_log_probs.append(log_prob)
+                gpu_values.append(values_t)
+                gpu_pred_rets.append(pred_rets)
+                active_history.append(list(active))
+
+                # ONE sync per step (not per episode) to feed env.step
+                actions_np = actions.cpu().numpy()
+
                 next_active = []
                 for j, i in enumerate(active):
                     _, _, fwd_returns = sampled[i]
-                    action = int(actions[j].item())
+                    action = int(actions_np[j])
 
                     next_state, reward, done = envs[i].step(action)
                     ep_rets[i] += reward
@@ -325,15 +357,12 @@ class PPOTrainer:
                     buf = ep_bufs[i]
                     buf["obs"].append(states[i])
                     buf["actions"].append(action)
-                    buf["log_probs"].append(float(log_prob[j].item()))
-                    buf["values"].append(float(values_t[j].item()))
                     buf["rewards"].append(reward)
                     buf["dones"].append(done)
                     c = cursors[i]
                     buf["actual_fwd_rets"].append(
                         float(fwd_returns[c]) if c < len(fwd_returns) else 0.0
                     )
-                    buf["pred_fwd_rets"].append(float(pred_rets[j].item()))
 
                     cursors[i] += 1
                     states[i]   = next_state
@@ -341,6 +370,20 @@ class PPOTrainer:
                         next_active.append(i)
 
                 active = next_active
+
+        # ── Bulk GPU→CPU transfer (3 syncs total for entire rollout) ──
+        all_lp  = torch.cat(gpu_log_probs).cpu().numpy()
+        all_v   = torch.cat(gpu_values).cpu().numpy()
+        all_pr  = torch.cat(gpu_pred_rets).cpu().numpy()
+
+        offset = 0
+        for active_at_step in active_history:
+            n = len(active_at_step)
+            for j, i in enumerate(active_at_step):
+                ep_bufs[i]["log_probs"].append(float(all_lp[offset + j]))
+                ep_bufs[i]["values"].append(float(all_v[offset + j]))
+                ep_bufs[i]["pred_fwd_rets"].append(float(all_pr[offset + j]))
+            offset += n
 
         # ── Merge all episode buffers ──────────────────────────────────
         obs_buf            = []
