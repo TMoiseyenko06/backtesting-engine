@@ -89,6 +89,11 @@ with st.sidebar:
     tf_label  = st.selectbox("Timeframe", list(TF_MAP.keys()), index=3)
     timeframe = TF_MAP[tf_label]
 
+    WINDOW_MAP = {"7 days": 7, "30 days": 30, "90 days": 90, "1 year": 365}
+    window_label = st.selectbox("Chart window", list(WINDOW_MAP.keys()), index=1,
+                                help="Limits candles sent to the browser — keeps it fast")
+    chart_window_days = WINDOW_MAP[window_label]
+
     st.markdown("---")
     start_btn = st.button("▶  Start Training", type="primary", width="stretch")
 
@@ -308,12 +313,28 @@ def _build_chart(
     timeframe: str,
     conf_threshold: float,
     cycle_num: int,
+    window_days: int = 30,
 ) -> go.Figure:
     """Build the full 2-row Plotly figure: candlestick + ghost candles / equity curve."""
 
-    raw_df  = _bars_to_df(test_bars)
-    agg     = _resample(raw_df, timeframe)
-    buy_gh, sell_gh = _build_ghost_df(predictions, agg, timeframe, conf_threshold)
+    raw_df = _bars_to_df(test_bars)
+    agg    = _resample(raw_df, timeframe)
+
+    # ── Window: limit candles sent to the browser ────────────────────────────
+    if not agg.empty:
+        win_start = agg.index[-1] - pd.Timedelta(days=window_days)
+        agg_view  = agg[agg.index >= win_start]
+    else:
+        agg_view  = agg
+        win_start = None
+
+    buy_gh, sell_gh = _build_ghost_df(predictions, agg_view, timeframe, conf_threshold)
+
+    # Filter trades to visible window
+    def _in_window(t):
+        return win_start is None or t.open_time >= win_start
+
+    trades_view = [t for t in trades if _in_window(t)] if trades else []
 
     fig = make_subplots(
         rows=2, cols=1,
@@ -329,9 +350,9 @@ def _build_chart(
     # ── Actual candles ──────────────────────────────────────────────────────
     fig.add_trace(
         go.Candlestick(
-            x=agg.index,
-            open=agg["open"],  high=agg["high"],
-            low=agg["low"],    close=agg["close"],
+            x=agg_view.index,
+            open=agg_view["open"],  high=agg_view["high"],
+            low=agg_view["low"],    close=agg_view["close"],
             name="Actual",
             increasing_line_color="#26a69a",
             decreasing_line_color="#ef5350",
@@ -379,10 +400,10 @@ def _build_chart(
         )
 
     # ── Trade entry / exit markers ───────────────────────────────────────────
-    if trades:
-        long_entries  = [(t.open_time,  t.open_price)  for t in trades if t.quantity > 0]
-        short_entries = [(t.open_time,  t.open_price)  for t in trades if t.quantity < 0]
-        exits         = [(t.close_time, t.close_price) for t in trades]
+    if trades_view:
+        long_entries  = [(t.open_time,  t.open_price)  for t in trades_view if t.quantity > 0]
+        short_entries = [(t.open_time,  t.open_price)  for t in trades_view if t.quantity < 0]
+        exits         = [(t.close_time, t.close_price) for t in trades_view]
 
         for times, prices, sym_shape, color, lbl in [
             (long_entries,  [p for _, p in long_entries],  "triangle-up",   "#00e676", "Buy entry"),
@@ -427,6 +448,19 @@ def _build_chart(
         legend=dict(orientation="h", y=1.02, x=0),
         margin=dict(l=10, r=10, t=60, b=10),
         font=dict(size=11),
+        xaxis=dict(
+            rangeselector=dict(
+                buttons=[
+                    dict(count=7,  label="1W", step="day",  stepmode="backward"),
+                    dict(count=1,  label="1M", step="month",stepmode="backward"),
+                    dict(count=3,  label="3M", step="month",stepmode="backward"),
+                    dict(step="all", label="All"),
+                ],
+                bgcolor="#1f2630",
+                activecolor="#42a5f5",
+                font=dict(color="#e0e0e0"),
+            ),
+        ),
     )
     fig.update_yaxes(showgrid=True, gridcolor="#1f2630", row=1, col=1)
     fig.update_yaxes(showgrid=True, gridcolor="#1f2630", row=2, col=1)
@@ -694,7 +728,8 @@ if st.session_state.cycle_results:
             margin=dict(l=10, r=10, t=30, b=10),
             xaxis_rangeslider_visible=False,
         )
-        st.plotly_chart(fig_all, width="stretch")
+        st.plotly_chart(fig_all, width="stretch",
+                        config={"scrollZoom": True, "displayModeBar": True})
 
     # Per-cycle tabs
     tab_labels = [f"Cycle {r['cycle']}" for r in results]
@@ -732,8 +767,13 @@ if st.session_state.cycle_results:
                     timeframe=timeframe,
                     conf_threshold=float(conf),
                     cycle_num=result["cycle"],
+                    window_days=chart_window_days,
                 )
-                st.plotly_chart(fig, width="stretch")
+                st.plotly_chart(
+                    fig,
+                    width="stretch",
+                    config={"scrollZoom": True, "displayModeBar": True},
+                )
 
                 ghost_buy  = sum(1 for _, s, c, _ in result["predictions"]
                                  if s == 2 and c >= float(conf))
