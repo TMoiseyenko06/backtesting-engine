@@ -133,16 +133,15 @@ class Trainer:
         train_ds = SequenceDataset(features, labels, self.seq_len, train_idx)
         val_ds   = SequenceDataset(features, labels, self.seq_len, val_idx)
 
-        train_loader = DataLoader(
-            train_ds, batch_size=self.batch_size, shuffle=True,
-            num_workers=self.num_workers, pin_memory=(self.device == "cuda"),
+        loader_kwargs = dict(
+            batch_size=self.batch_size,
+            num_workers=self.num_workers,
+            pin_memory=(self.device == "cuda"),
             persistent_workers=(self.num_workers > 0),
+            multiprocessing_context="forkserver" if self.num_workers > 0 else None,
         )
-        val_loader = DataLoader(
-            val_ds, batch_size=self.batch_size, shuffle=False,
-            num_workers=self.num_workers, pin_memory=(self.device == "cuda"),
-            persistent_workers=(self.num_workers > 0),
-        )
+        train_loader = DataLoader(train_ds, shuffle=True,  **loader_kwargs)
+        val_loader   = DataLoader(val_ds,   shuffle=False, **loader_kwargs)
 
         # Class weights from training labels only
         train_labels = labels[train_idx[train_idx >= self.seq_len]]
@@ -227,7 +226,8 @@ class Trainer:
         total_samples = 0
 
         grad_ctx = torch.enable_grad() if training else torch.no_grad()
-        amp_ctx  = torch.cuda.amp.autocast(
+        amp_ctx  = torch.amp.autocast(
+            device_type="cuda" if self.device == "cuda" else "cpu",
             enabled=self._use_amp, dtype=self._amp_dtype
         )
 
@@ -240,7 +240,9 @@ class Trainer:
                     self.optimiser.zero_grad()
 
                 logits = self.model(x)
-                loss   = criterion(logits, y)
+                # Cast to float32 for the loss: BF16 log-softmax can underflow
+                # to -inf with weighted CrossEntropyLoss → NaN gradients
+                loss   = criterion(logits.float(), y)
 
                 if training:
                     loss.backward()
