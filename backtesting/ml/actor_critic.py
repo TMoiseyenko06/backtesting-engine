@@ -102,9 +102,12 @@ class ActorCriticLSTM(nn.Module):
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         """Run LSTM + LayerNorm, return last hidden state (batch, hidden)."""
-        # LSTM must run in float32 — BF16 sequential accumulation loses
-        # mantissa precision and produces NaN in hidden states.
-        out, _ = self.lstm(x.float())
+        # Disable autocast for the LSTM: even with float32 input the LSTM
+        # weight matmuls are downcast to BF16 by the outer autocast context,
+        # causing NaN in hidden states.  autocast(enabled=False) forces all
+        # internal matmuls to stay in float32.
+        with torch.amp.autocast(device_type="cuda", enabled=False):
+            out, _ = self.lstm(x.float())
         return self.norm(out[:, -1, :])
 
     # ------------------------------------------------------------------
