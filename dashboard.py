@@ -88,7 +88,7 @@ with st.sidebar:
     timeframe = TF_MAP[tf_label]
 
     st.markdown("---")
-    start_btn = st.button("▶  Start Training", type="primary", use_container_width=True)
+    start_btn = st.button("▶  Start Training", type="primary", width="stretch")
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -192,7 +192,7 @@ def _bars_to_df(bars) -> pd.DataFrame:
 
 
 def _resample(df: pd.DataFrame, tf: str) -> pd.DataFrame:
-    rule = tf.replace("min", "T").replace("1h", "1h").replace("4h", "4h").replace("1D", "1D")
+    rule = tf
     agg = df.resample(rule, label="left", closed="left").agg(
         open=("open", "first"),
         high=("high", "max"),
@@ -230,9 +230,7 @@ def _build_ghost_df(
         return empty, empty
 
     atr = _compute_atr(agg)
-    freq = pd.tseries.frequencies.to_offset(
-        tf.replace("min", "T").replace("1h", "1h").replace("4h", "4h").replace("1D", "1D")
-    )
+    freq = pd.tseries.frequencies.to_offset(tf)
 
     # Map each prediction to its aggregated period index
     pred_df = pd.DataFrame(predictions, columns=["ts", "signal", "conf", "close"])
@@ -244,9 +242,7 @@ def _build_ghost_df(
         return empty, empty
 
     pred_df["ts"] = pd.to_datetime(pred_df["ts"])
-    pred_df["period"] = pred_df["ts"].dt.floor(
-        tf.replace("min", "T").replace("1h", "h").replace("4h", "4h").replace("1D", "D")
-    )
+    pred_df["period"] = pred_df["ts"].dt.floor(tf)
 
     # For each period, aggregate: weighted-average direction and last close
     grouped = (
@@ -673,7 +669,7 @@ if st.session_state.cycle_results:
             margin=dict(l=10, r=10, t=30, b=10),
             xaxis_rangeslider_visible=False,
         )
-        st.plotly_chart(fig_all, use_container_width=True)
+        st.plotly_chart(fig_all, width="stretch")
 
     # Per-cycle tabs
     tab_labels = [f"Cycle {r['cycle']}" for r in results]
@@ -686,7 +682,7 @@ if st.session_state.cycle_results:
                 fold_df = pd.DataFrame(result["fold_results"])
                 fold_df.index = fold_df.index + 1
                 fold_df.index.name = "Fold"
-                st.dataframe(fold_df.style.format("{:.4f}"), use_container_width=True)
+                st.dataframe(fold_df.style.format("{:.4f}"), width="stretch")
             st.caption(
                 f"Mean val_acc: **{result['mean_val_acc']:.4f}**  "
                 f"Best val_acc: **{result['best_val_acc']:.4f}**  "
@@ -712,7 +708,7 @@ if st.session_state.cycle_results:
                     conf_threshold=float(conf),
                     cycle_num=result["cycle"],
                 )
-                st.plotly_chart(fig, use_container_width=True)
+                st.plotly_chart(fig, width="stretch")
 
                 ghost_buy  = sum(1 for _, s, c, _ in result["predictions"]
                                  if s == 2 and c >= float(conf))
