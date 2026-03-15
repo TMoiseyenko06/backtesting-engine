@@ -34,8 +34,10 @@ the model focus on longer multi-bar swings; decreasing H makes it more reactive.
 
 Multi-GPU
 ---------
-DataParallel is used for the PPO update step.  Rollout collection runs on the
-primary GPU (sequential, policy inference per bar).
+DataParallel is used for the PPO update step.  Rollout collection is
+vectorised: all rollout_days episodes are stepped in lock-step, batching
+their observations into a single GPU forward pass at every bar, so both GPUs
+are fed during inference as well as during the update.
 """
 
 from __future__ import annotations
@@ -128,7 +130,8 @@ class PPOTrainer:
         self.reward_scale       = reward_scale
         self.device             = device or _auto_device()
 
-        self._env = TradingEnv(
+        # Store kwargs so _collect_rollout can spin up per-episode envs
+        self._env_kwargs = dict(
             seq_len=seq_len,
             n_features=n_features,
             multiplier=multiplier,
@@ -136,6 +139,18 @@ class PPOTrainer:
             contracts=contracts,
             max_loss=max_loss,
             reward_scale=reward_scale,
+        )
+        self._env = TradingEnv(**self._env_kwargs)   # kept for external callers
+
+        # ── AMP — LSTM shields itself to float32, linear heads use BF16/FP16
+        _is_h200 = (
+            self.device == "cuda" and torch.cuda.is_available() and
+            "H200" in torch.cuda.get_device_name(0)
+        )
+        self._use_amp   = (self.device == "cuda")
+        self._amp_dtype = torch.bfloat16 if _is_h200 else torch.float16
+        self._scaler    = torch.amp.GradScaler(
+            device="cuda", enabled=self._use_amp
         )
 
         base_model = ActorCriticLSTM(
@@ -147,11 +162,12 @@ class PPOTrainer:
 
         n_gpus = torch.cuda.device_count() if self.device == "cuda" else 1
         if n_gpus > 1:
+            self.minibatch_size = minibatch_size * n_gpus
             self.model = nn.DataParallel(base_model)
             print(
                 f"  [multi-gpu] DataParallel across {n_gpus} GPUs  "
-                f"(effective mini-batch = {minibatch_size}  "
-                f"·  {minibatch_size // n_gpus} per GPU)"
+                f"(minibatch scaled {minibatch_size} → {self.minibatch_size}  "
+                f"·  {minibatch_size} per GPU)"
             )
         else:
             self.model = base_model
@@ -259,68 +275,106 @@ class PPOTrainer:
         self, episodes: list[tuple[np.ndarray, np.ndarray, np.ndarray]]
     ) -> dict:
         """
-        Sample ``rollout_days`` episodes and collect one full trajectory each.
-        Records actual forward returns alongside experience for the aux loss.
+        Sample ``rollout_days`` episodes and collect trajectories.
+
+        All active episodes are stepped in lock-step so their observations
+        can be batched into a single GPU forward pass at every bar — this
+        keeps both H200s busy during inference instead of issuing one
+        batch-1 call per bar per episode.
         """
         self._policy.eval()
 
-        obs_buf             = []
-        action_buf          = []
-        log_prob_buf        = []
-        value_buf           = []
-        reward_buf          = []
-        done_buf            = []
-        actual_fwd_ret_buf  = []   # H-bar ahead ground truth
-        pred_fwd_ret_buf    = []   # model's predicted forward return (for error tracking)
-        episode_returns     = []
+        sampled  = random.choices(episodes, k=self.rollout_days)
+        n_ep     = len(sampled)
 
-        sampled = random.choices(episodes, k=self.rollout_days)
+        # One independent env per episode
+        envs     = [TradingEnv(**self._env_kwargs) for _ in range(n_ep)]
+        states   = [env.reset(feat, prices)
+                    for env, (feat, prices, _) in zip(envs, sampled)]
+        cursors  = [self.seq_len] * n_ep   # index into fwd_returns
+        ep_rets  = [0.0] * n_ep
+        active   = list(range(n_ep))       # episode indices still running
 
-        for feat, prices, fwd_returns in sampled:
-            state   = self._env.reset(feat, prices)
-            ep_ret  = 0.0
-            done    = False
-            cursor  = self._env.seq_len   # first actionable bar index
+        # Per-episode experience buffers
+        ep_bufs  = [{"obs": [], "actions": [], "log_probs": [],
+                     "values": [], "rewards": [], "dones": [],
+                     "actual_fwd_rets": [], "pred_fwd_rets": []}
+                    for _ in range(n_ep)]
 
-            while not done:
-                x = (
-                    torch.tensor(state, dtype=torch.float32)
-                    .unsqueeze(0)
-                    .to(self.device)
-                )
-                action, log_prob, value, _, pred_ret = self._policy.act(x)
+        with torch.no_grad():
+            while active:
+                # ── Batch all active states into one GPU call ──────────
+                x = torch.tensor(
+                    np.stack([states[i] for i in active]),
+                    dtype=torch.float32,
+                ).to(self.device)           # (n_active, seq_len, n_feat)
 
-                next_state, reward, done = self._env.step(int(action.item()))
-                ep_ret += reward
+                logits, values_t, pred_rets = self._policy(x)
+                dist     = torch.distributions.Categorical(logits=logits)
+                actions  = dist.sample()
+                log_prob = dist.log_prob(actions)
 
-                obs_buf.append(state)
-                action_buf.append(int(action.item()))
-                log_prob_buf.append(float(log_prob.item()))
-                value_buf.append(float(value.item()))
-                reward_buf.append(reward)
-                done_buf.append(done)
-                # Ground-truth target for prediction head
-                actual_fwd_ret_buf.append(float(fwd_returns[cursor]) if cursor < len(fwd_returns) else 0.0)
-                pred_fwd_ret_buf.append(float(pred_ret.item()))
+                next_active = []
+                for j, i in enumerate(active):
+                    _, _, fwd_returns = sampled[i]
+                    action = int(actions[j].item())
 
-                cursor += 1
-                state   = next_state
+                    next_state, reward, done = envs[i].step(action)
+                    ep_rets[i] += reward
 
-            episode_returns.append(ep_ret)
+                    buf = ep_bufs[i]
+                    buf["obs"].append(states[i])
+                    buf["actions"].append(action)
+                    buf["log_probs"].append(float(log_prob[j].item()))
+                    buf["values"].append(float(values_t[j].item()))
+                    buf["rewards"].append(reward)
+                    buf["dones"].append(done)
+                    c = cursors[i]
+                    buf["actual_fwd_rets"].append(
+                        float(fwd_returns[c]) if c < len(fwd_returns) else 0.0
+                    )
+                    buf["pred_fwd_rets"].append(float(pred_rets[j].item()))
+
+                    cursors[i] += 1
+                    states[i]   = next_state
+                    if not done:
+                        next_active.append(i)
+
+                active = next_active
+
+        # ── Merge all episode buffers ──────────────────────────────────
+        obs_buf            = []
+        action_buf         = []
+        log_prob_buf       = []
+        value_buf          = []
+        reward_buf         = []
+        done_buf           = []
+        actual_fwd_ret_buf = []
+        pred_fwd_ret_buf   = []
+
+        for buf in ep_bufs:
+            obs_buf.extend(buf["obs"])
+            action_buf.extend(buf["actions"])
+            log_prob_buf.extend(buf["log_probs"])
+            value_buf.extend(buf["values"])
+            reward_buf.extend(buf["rewards"])
+            done_buf.extend(buf["dones"])
+            actual_fwd_ret_buf.extend(buf["actual_fwd_rets"])
+            pred_fwd_ret_buf.extend(buf["pred_fwd_rets"])
 
         pred_errors = np.abs(
             np.array(pred_fwd_ret_buf) - np.array(actual_fwd_ret_buf)
         )
 
         return {
-            "obs":               np.array(obs_buf,            dtype=np.float32),
-            "actions":           np.array(action_buf,         dtype=np.int64),
-            "log_probs":         np.array(log_prob_buf,       dtype=np.float32),
-            "values":            np.array(value_buf,          dtype=np.float32),
-            "rewards":           np.array(reward_buf,         dtype=np.float32),
-            "dones":             np.array(done_buf,           dtype=bool),
-            "actual_fwd_rets":   np.array(actual_fwd_ret_buf, dtype=np.float32),
-            "episode_returns":   episode_returns,
+            "obs":                np.array(obs_buf,            dtype=np.float32),
+            "actions":            np.array(action_buf,         dtype=np.int64),
+            "log_probs":          np.array(log_prob_buf,       dtype=np.float32),
+            "values":             np.array(value_buf,          dtype=np.float32),
+            "rewards":            np.array(reward_buf,         dtype=np.float32),
+            "dones":              np.array(done_buf,           dtype=bool),
+            "actual_fwd_rets":    np.array(actual_fwd_ret_buf, dtype=np.float32),
+            "episode_returns":    ep_rets,
             "pred_return_errors": pred_errors,
         }
 
@@ -369,38 +423,50 @@ class PPOTrainer:
         dataset = TensorDataset(obs, actions, old_lp, returns, advantages, actual_fwd)
         loader  = DataLoader(dataset, batch_size=self.minibatch_size, shuffle=True)
 
+        amp_ctx = torch.amp.autocast(
+            device_type="cuda" if self.device == "cuda" else "cpu",
+            enabled=self._use_amp,
+            dtype=self._amp_dtype,
+        )
+
         tot_policy = tot_value = tot_entropy = tot_pred = tot_clip = 0.0
         n_batches  = 0
 
         for batch_obs, batch_act, batch_old_lp, batch_ret, batch_adv, batch_fwd in loader:
-            logits, values, pred_returns = self.model.forward_full(batch_obs) \
-                if not isinstance(self.model, nn.DataParallel) \
-                else self.model.module.forward_full(batch_obs)
-
-            dist      = torch.distributions.Categorical(logits=logits)
-            new_lp    = dist.log_prob(batch_act)
-            entropy   = dist.entropy().mean()
-
-            ratio     = torch.exp(new_lp - batch_old_lp)
-            clip_frac = float(((ratio - 1.0).abs() > self.clip_eps).float().mean().item())
-
-            surr1  = ratio * batch_adv
-            surr2  = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * batch_adv
-            l_clip = -torch.min(surr1, surr2).mean()
-            l_val  = 0.5 * (values - batch_ret).pow(2).mean()
-            l_pred = torch.nn.functional.mse_loss(pred_returns, batch_fwd)
-
-            loss = (
-                l_clip
-                + self.value_loss_coef * l_val
-                - self.entropy_coef    * entropy
-                + self.pred_loss_coef  * l_pred
-            )
-
             self.optimiser.zero_grad()
-            loss.backward()
+
+            with amp_ctx:
+                # self.model is either the base model or nn.DataParallel —
+                # forward() now returns all three heads so DataParallel can
+                # scatter/gather across both GPUs correctly.
+                logits, values, pred_returns = self.model(batch_obs)
+
+                dist      = torch.distributions.Categorical(logits=logits)
+                new_lp    = dist.log_prob(batch_act)
+                entropy   = dist.entropy().mean()
+
+                ratio     = torch.exp(new_lp - batch_old_lp)
+                clip_frac = float(((ratio - 1.0).abs() > self.clip_eps).float().mean().item())
+
+                surr1  = ratio * batch_adv
+                surr2  = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * batch_adv
+                l_clip = -torch.min(surr1, surr2).mean()
+                l_val  = 0.5 * (values - batch_ret).pow(2).mean()
+                l_pred = torch.nn.functional.mse_loss(pred_returns, batch_fwd)
+
+                loss = (
+                    l_clip
+                    + self.value_loss_coef * l_val
+                    - self.entropy_coef    * entropy
+                    + self.pred_loss_coef  * l_pred
+                )
+
+            # GradScaler is a no-op when AMP is disabled (enabled=False)
+            self._scaler.scale(loss).backward()
+            self._scaler.unscale_(self.optimiser)
             nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            self.optimiser.step()
+            self._scaler.step(self.optimiser)
+            self._scaler.update()
 
             tot_policy  += l_clip.item()
             tot_value   += l_val.item()

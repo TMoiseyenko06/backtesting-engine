@@ -102,30 +102,18 @@ class ActorCriticLSTM(nn.Module):
 
     def _encode(self, x: torch.Tensor) -> torch.Tensor:
         """Run LSTM + LayerNorm, return last hidden state (batch, hidden)."""
-        out, _ = self.lstm(x)
+        # LSTM must run in float32 — BF16 sequential accumulation loses
+        # mantissa precision and produces NaN in hidden states.
+        out, _ = self.lstm(x.float())
         return self.norm(out[:, -1, :])
 
     # ------------------------------------------------------------------
-    # Batch forward — policy + value only (PPO policy gradient step)
+    # Batch forward — all three heads
+    # Called by DataParallel during the PPO update step, so it must
+    # return all outputs needed by the loss (logits, values, pred_returns).
     # ------------------------------------------------------------------
 
     def forward(
-        self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        x : (batch, seq_len, n_features)
-        Returns logits (batch, n_actions), values (batch,)
-        """
-        h      = self._encode(x)
-        logits = self.policy_head(h)
-        values = self.value_head(h).squeeze(-1)
-        return logits, values
-
-    # ------------------------------------------------------------------
-    # Full forward — all three heads (used in PPO update with aux loss)
-    # ------------------------------------------------------------------
-
-    def forward_full(
         self, x: torch.Tensor
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
@@ -140,6 +128,9 @@ class ActorCriticLSTM(nn.Module):
         values       = self.value_head(h).squeeze(-1)
         pred_returns = self.prediction_head(h).squeeze(-1)
         return logits, values, pred_returns
+
+    # Alias kept for external callers (RLTradingStrategy, act, predict_rl).
+    forward_full = forward
 
     # ------------------------------------------------------------------
     # Stochastic action sampling — rollout collection

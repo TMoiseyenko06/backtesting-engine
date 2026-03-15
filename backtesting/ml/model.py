@@ -58,7 +58,10 @@ class LSTMModel(nn.Module):
         x : (batch, seq_len, n_features)
         returns logits : (batch, n_classes)
         """
-        out, _ = self.lstm(x)        # (batch, seq_len, hidden)
+        # LSTM must run in float32 — BF16 sequential accumulation loses
+        # mantissa precision and produces NaN in hidden states.
+        # The outer autocast context covers the linear head layers.
+        out, _ = self.lstm(x.float())   # (batch, seq_len, hidden)
         h = out[:, -1, :]            # last timestep
         h = self.norm(h)
         return self.head(h)          # (batch, n_classes)

@@ -14,6 +14,7 @@ Features
 
 from __future__ import annotations
 
+import os
 from typing import Optional
 
 import numpy as np
@@ -65,14 +66,23 @@ class Trainer:
         self.batch_size   = batch_size
         self.max_epochs   = max_epochs
         self.patience     = patience
-        self.num_workers  = num_workers
         self.device       = device or _auto_device()
 
-        # H200 / Ampere+ automatically use TF32 for matmul/cuDNN (PyTorch default).
-        # BF16 autocast causes NaN in LSTM hidden states due to 7-bit mantissa
-        # precision loss in sequential updates — disabled in favour of TF32.
-        self._use_amp   = False
-        self._amp_dtype = torch.bfloat16  # unused, kept for future opt-in
+        # ── AMP — LSTM shields itself to float32 inside forward(), so
+        #    BF16 autocast is safe for the linear head layers.
+        #    H200 has native BF16 tensor cores; A100/older use FP16.
+        _is_h200 = (
+            self.device == "cuda" and torch.cuda.is_available() and
+            "H200" in torch.cuda.get_device_name(0)
+        )
+        self._use_amp   = (self.device == "cuda")
+        self._amp_dtype = torch.bfloat16 if _is_h200 else torch.float16
+        self._scaler    = torch.amp.GradScaler(
+            device="cuda", enabled=self._use_amp
+        )
+
+        # ── Auto-scale num_workers to available CPUs (cap at 16)
+        self.num_workers = min(num_workers, os.cpu_count() or num_workers, 16)
 
         base_model = LSTMModel(
             n_features=n_features,
@@ -93,7 +103,10 @@ class Trainer:
                 except RuntimeError:
                     print(f"  [checkpoint] Architecture mismatch — starting fresh")
 
-        # ── torch.compile (PyTorch 2.0+, fuses CUDA kernels)
+        # ── Auto-enable torch.compile on H200 (fuses CUDA kernels, ~15-30% gain)
+        if not compile_model and _is_h200:
+            compile_model = True
+            print("  [H200] torch.compile auto-enabled")
         if compile_model:
             try:
                 base_model = torch.compile(base_model)
@@ -101,12 +114,14 @@ class Trainer:
             except Exception as e:
                 print(f"  [compile] skipped: {e}")
 
-        # ── Multi-GPU DataParallel
+        # ── Multi-GPU DataParallel; auto-scale batch to fill both GPUs
         n_gpus = torch.cuda.device_count() if self.device == "cuda" else 1
         if n_gpus > 1:
+            self.batch_size = batch_size * n_gpus
             self.model = nn.DataParallel(base_model)
             print(f"  [multi-gpu] DataParallel across {n_gpus} GPUs  "
-                  f"(effective batch = {batch_size}  ·  {batch_size // n_gpus} per GPU)")
+                  f"(batch scaled {batch_size} → {self.batch_size}  ·  "
+                  f"{batch_size} per GPU)")
         else:
             self.model = base_model
 
@@ -140,6 +155,7 @@ class Trainer:
             num_workers=self.num_workers,
             pin_memory=(self.device == "cuda"),
             persistent_workers=(self.num_workers > 0),
+            prefetch_factor=(2 if self.num_workers > 0 else None),
             multiprocessing_context="forkserver" if self.num_workers > 0 else None,
         )
         train_loader = DataLoader(train_ds, shuffle=True,  **loader_kwargs)
@@ -247,9 +263,12 @@ class Trainer:
                 loss   = criterion(logits.float(), y)
 
                 if training:
-                    loss.backward()
+                    # GradScaler is a no-op when AMP is disabled (enabled=False)
+                    self._scaler.scale(loss).backward()
+                    self._scaler.unscale_(self.optimiser)
                     nn.utils.clip_grad_norm_(self.model.parameters(), 1.0)
-                    self.optimiser.step()
+                    self._scaler.step(self.optimiser)
+                    self._scaler.update()
 
                 preds = logits.argmax(dim=-1)
                 total_correct += (preds == y).sum().item()
