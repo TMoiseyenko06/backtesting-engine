@@ -305,6 +305,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Bars ahead for the model to predict (default 30 = 30 min)")
     p.add_argument("--ntfy-topic",         default="",               dest="ntfy_topic",
                    help="ntfy.sh topic to push a notification to when finished (optional)")
+    p.add_argument("--compile",            action="store_true",      dest="compile_model",
+                   help="Enable torch.compile for fused CUDA kernels (PyTorch >= 2.0, ~10-30%% speedup)")
     return p.parse_args()
 
 
@@ -432,6 +434,7 @@ def main() -> None:
             batch_size=args.batch_size,
             max_epochs=args.epochs,
             device=device,
+            compile_model=args.compile_model,
         )
         splits = walk_forward_splits(len(train_bars), n_splits=args.folds)
         if not splits:
