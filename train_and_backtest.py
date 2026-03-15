@@ -1,20 +1,32 @@
 """
-NQ LSTM — Train on all data except last year, Backtest on last 1 year
-======================================================================
+NQ LSTM / PPO-RL — Train on all data except last year, Backtest on last 1 year
+===============================================================================
 
 Usage
 -----
     python train_and_backtest.py <path-to-dbn-file> [options]
 
-    python train_and_backtest.py glbx-mdp3-20210313-20260313.ohlcv-1m.dbn.zstd
-    python train_and_backtest.py data/nq.dbn.zstd --contracts 2 --cash 1000000
+    python train_and_backtest.py data/nq.dbn                          # RL (default)
+    python train_and_backtest.py data/nq.dbn --no-rl                  # supervised
+    python train_and_backtest.py data/nq.dbn --contracts 2 --cash 1000000
+
+Training modes
+--------------
+  RL (default, --rl):
+    Proximal Policy Optimization — the network directly learns to trade for P&L.
+    The actor-critic LSTM outputs a desired position (long/flat/short) each bar
+    and is rewarded by the mark-to-market P&L change minus transaction costs.
+
+  Supervised (--no-rl):
+    3-class cross-entropy on forward-return labels.  The model predicts direction;
+    a rule-based layer translates predictions into trades.
 
 Arguments
 ---------
     path            Path to the Databento .dbn or .dbn.zstd batch file.
 
-Options
--------
+Options (shared)
+----------------
     --symbol        Bar symbol label (default: NQ)
     --multiplier    Contract multiplier, $ per point (default: 20.0)
     --cash          Starting capital (default: 500000)
@@ -22,14 +34,27 @@ Options
     --maint-margin  Maintenance margin per contract (default: 19000)
     --contracts     Contracts per trade (default: 1)
     --seq-len       LSTM sequence length, bars (default: 30)
+    --hidden        LSTM hidden size (default: 512)
+    --save-model    Path to save model weights (default: models/nq_lstm_ohlcv1m.pt)
+    --no-save       Skip saving the model to disk
+    --max-loss      Max dollar loss per trade / stop-loss (default: 2500)
+    --eod-hour      UTC hour to flatten all positions (default: 20 ≈ 4 PM EDT)
+    --no-entry-hour UTC hour after which no new entries (default: 19)
+    --min-hold-bars Min bars to hold before signal-driven exit/flip (default: 2)
+
+Options (RL-specific)
+---------------------
+    --rl-iters      PPO training iterations (default: 200)
+    --rl-days       Episodes (trading days) per PPO rollout (default: 16)
+    --rl-ppo-epochs PPO update epochs per iteration (default: 4)
+    --rl-lr         PPO Adam learning rate (default: 3e-4)
+
+Options (supervised-specific)
+------------------------------
     --conf          Minimum signal confidence 0-1 (default: 0.50)
     --folds         Walk-forward training folds (default: 3)
     --epochs        Max training epochs per fold (default: 50)
-    --hidden        LSTM hidden size (default: 512)
     --batch-size    Training batch size (default: 4096)
-    --save-model    Path to save the trained model .pt file
-                    (default: models/nq_lstm_ohlcv1m.pt)
-    --no-save       Skip saving the model to disk
 """
 
 from __future__ import annotations
@@ -155,6 +180,19 @@ def _print_train_section(fold_results: list, model_path: str | None, elapsed: fl
     print()
 
 
+def _print_rl_train_section(metrics: dict, model_path: str | None, elapsed: float) -> None:
+    print(_section("TRAIN  (PPO-RL)"))
+    print(_kv("Mean daily P&L :", f"${metrics.get('mean_episode_pnl', 0):+,.0f}"))
+    print(_kv("Policy loss    :", f"{metrics.get('policy_loss', 0):.4f}"))
+    print(_kv("Value  loss    :", f"{metrics.get('value_loss',  0):.4f}"))
+    print(_kv("Entropy        :", f"{metrics.get('entropy',     0):.4f}"))
+    print(_kv("Clip fraction  :", f"{metrics.get('clip_frac',   0):.3f}"))
+    print(_kv("Train time     :", f"{elapsed:.1f}s"))
+    if model_path:
+        print(_kv("Model saved    :", model_path))
+    print()
+
+
 def _print_backtest_section(analytics, symbol: str, test_bars: int,
                              b_start: str, b_end: str) -> None:
     a = analytics
@@ -216,6 +254,20 @@ def _parse_args() -> argparse.Namespace:
                    help="UTC hour after which no new entries are taken (default 19)")
     p.add_argument("--min-hold-bars", type=int,  default=2, dest="min_hold_bars",
                    help="Min bars to hold before a signal-driven exit/flip (default 2)")
+    # Training mode
+    p.add_argument("--rl",    dest="rl", action="store_true",  default=True,
+                   help="Use PPO reinforcement learning (default)")
+    p.add_argument("--no-rl", dest="rl", action="store_false",
+                   help="Use supervised cross-entropy training instead of RL")
+    # RL-specific
+    p.add_argument("--rl-iters",      type=int,   default=200,  dest="rl_iters",
+                   help="PPO training iterations (default 200)")
+    p.add_argument("--rl-days",       type=int,   default=16,   dest="rl_days",
+                   help="Episodes per PPO rollout (default 16)")
+    p.add_argument("--rl-ppo-epochs", type=int,   default=4,    dest="rl_ppo_epochs",
+                   help="PPO update epochs per iteration (default 4)")
+    p.add_argument("--rl-lr",         type=float, default=3e-4, dest="rl_lr",
+                   help="PPO Adam learning rate (default 3e-4)")
     return p.parse_args()
 
 
@@ -230,18 +282,16 @@ def main() -> None:
     from backtesting.data_feed import DataFeed
     from backtesting.engine import BacktestEngine
     from backtesting.loaders.databento import from_databento_file
-    from backtesting.ml.dataset import make_labels, walk_forward_splits
     from backtesting.ml.features import make_features
-    from backtesting.ml.trainer import Trainer
     from backtesting.portfolio import Portfolio, MarginSpec
-    from strategies.lstm_signal import LSTMSignalStrategy
 
     # ── 1. GPU detection ──────────────────────────────────────────────────
     device_info = _detect_device()
     device = device_info["device"]
 
+    mode_label = "PPO-RL" if args.rl else "SUPERVISED"
     print()
-    print(_banner(f"NQ LSTM  ·  DATABENTO OHLCV-1m  ·  TRAIN ALL  /  BACKTEST LAST 1 YEAR"))
+    print(_banner(f"NQ LSTM  ·  DATABENTO OHLCV-1m  ·  {mode_label}  ·  TRAIN ALL  /  BACKTEST LAST 1 YEAR"))
     print()
     _print_device_section(device_info)
 
@@ -264,67 +314,125 @@ def main() -> None:
 
     _print_data_section(args.path, bars, split)
 
-    # ── 4. Feature engineering & labels on training set ───────────────────
-    print("  Building features & labels …", flush=True)
+    # ── 4. Feature engineering on training set ────────────────────────────
+    print("  Building features …", flush=True)
     features = make_features(train_bars)
-    labels   = make_labels(train_bars)
     print(f"  Features shape : {features.shape}  (train set)")
 
-    label_counts = np.bincount(labels, minlength=3)
-    print(
-        f"  Label balance  : "
-        f"Sell={label_counts[0]:,}  Flat={label_counts[1]:,}  Buy={label_counts[2]:,}\n"
-    )
+    if not args.rl:
+        from backtesting.ml.dataset import make_labels
+        labels = make_labels(train_bars)
+        label_counts = np.bincount(labels, minlength=3)
+        print(
+            f"  Label balance  : "
+            f"Sell={label_counts[0]:,}  Flat={label_counts[1]:,}  Buy={label_counts[2]:,}"
+        )
+    print()
 
-    # ── 5. Walk-forward training ──────────────────────────────────────────
-    print(f"  Training LSTM — {args.folds} walk-forward folds …\n", flush=True)
-
-    trainer = Trainer(
-        hidden_size=args.hidden,
-        seq_len=args.seq_len,
-        batch_size=args.batch_size,
-        max_epochs=args.epochs,
-        device=device,
-    )
-
-    splits = walk_forward_splits(len(train_bars), n_splits=args.folds)
-    if not splits:
-        print("  ERROR: not enough training data for walk-forward splits.", file=sys.stderr)
-        sys.exit(1)
-
-    fold_results = []
-    t0 = time.time()
-    for i, (train_idx, val_idx) in enumerate(splits):
-        result = trainer.fit(features, labels, train_idx, val_idx, fold=i)
-        fold_results.append(result)
-    elapsed = time.time() - t0
-
-    # Save model
+    # ── 5. Training ───────────────────────────────────────────────────────
     model_path: str | None = None
     if not args.no_save:
         model_path = args.save_model
         Path(model_path).parent.mkdir(parents=True, exist_ok=True)
-        trainer.save(model_path)
 
-    print()
-    _print_train_section(fold_results, model_path, elapsed)
+    t0 = time.time()
 
-    # ── 6. Backtest on held-out 20% ───────────────────────────────────────
-    warmup = args.seq_len + 60   # seq_len + SMA-50 warmup
-    feed_test = DataFeed(test_bars, warmup_bars=warmup)
+    if args.rl:
+        # ── PPO reinforcement learning ────────────────────────────────
+        from backtesting.ml.ppo_trainer import PPOTrainer
+        from strategies.rl_trading import RLTradingStrategy
 
-    strategy = LSTMSignalStrategy(
-        model=trainer.model.module if isinstance(trainer.model, torch.nn.DataParallel) else trainer.model,
-        device=device,
-        symbol=args.symbol,
-        seq_len=args.seq_len,
-        confidence_threshold=args.conf,
-        contracts=args.contracts,
-        max_loss_per_trade=args.max_loss,
-        eod_hour_utc=args.eod_hour,
-        no_entry_hour_utc=args.no_entry_hour,
-        min_hold_bars=args.min_hold_bars,
-    )
+        print(f"  Training with PPO (RL) — {args.rl_iters} iterations …\n", flush=True)
+        ppo_trainer = PPOTrainer(
+            hidden_size=args.hidden,
+            seq_len=args.seq_len,
+            lr=args.rl_lr,
+            n_iterations=args.rl_iters,
+            rollout_days=args.rl_days,
+            ppo_epochs=args.rl_ppo_epochs,
+            device=device,
+            multiplier=args.multiplier,
+            commission=2.0,
+            contracts=args.contracts,
+            max_loss=args.max_loss,
+        )
+        rl_metrics = ppo_trainer.fit(train_bars, features)
+        elapsed = time.time() - t0
+
+        if model_path:
+            ppo_trainer.save(model_path)
+
+        print()
+        _print_rl_train_section(rl_metrics, model_path, elapsed)
+
+        trained_model = ppo_trainer._policy   # bare ActorCriticLSTM
+
+        # ── 6a. Backtest (RL) ─────────────────────────────────────────
+        warmup   = args.seq_len + 60
+        feed_test = DataFeed(test_bars, warmup_bars=warmup)
+        strategy = RLTradingStrategy(
+            model=trained_model,
+            device=device,
+            symbol=args.symbol,
+            seq_len=args.seq_len,
+            contracts=args.contracts,
+            max_loss_per_trade=args.max_loss,
+            eod_hour_utc=args.eod_hour,
+            no_entry_hour_utc=args.no_entry_hour,
+            min_hold_bars=args.min_hold_bars,
+        )
+
+    else:
+        # ── Supervised walk-forward training ─────────────────────────
+        from backtesting.ml.dataset import walk_forward_splits
+        from backtesting.ml.trainer import Trainer
+        from strategies.lstm_signal import LSTMSignalStrategy
+
+        print(f"  Training LSTM — {args.folds} walk-forward folds …\n", flush=True)
+        trainer = Trainer(
+            hidden_size=args.hidden,
+            seq_len=args.seq_len,
+            batch_size=args.batch_size,
+            max_epochs=args.epochs,
+            device=device,
+        )
+        splits = walk_forward_splits(len(train_bars), n_splits=args.folds)
+        if not splits:
+            print("  ERROR: not enough training data for walk-forward splits.", file=sys.stderr)
+            sys.exit(1)
+
+        fold_results = []
+        for i, (train_idx, val_idx) in enumerate(splits):
+            fold_results.append(trainer.fit(features, labels, train_idx, val_idx, fold=i))
+        elapsed = time.time() - t0
+
+        if model_path:
+            trainer.save(model_path)
+
+        print()
+        _print_train_section(fold_results, model_path, elapsed)
+
+        trained_model = (
+            trainer.model.module
+            if isinstance(trainer.model, torch.nn.DataParallel)
+            else trainer.model
+        )
+
+        # ── 6b. Backtest (supervised) ─────────────────────────────────
+        warmup   = args.seq_len + 60
+        feed_test = DataFeed(test_bars, warmup_bars=warmup)
+        strategy = LSTMSignalStrategy(
+            model=trained_model,
+            device=device,
+            symbol=args.symbol,
+            seq_len=args.seq_len,
+            confidence_threshold=args.conf,
+            contracts=args.contracts,
+            max_loss_per_trade=args.max_loss,
+            eod_hour_utc=args.eod_hour,
+            no_entry_hour_utc=args.no_entry_hour,
+            min_hold_bars=args.min_hold_bars,
+        )
 
     portfolio = Portfolio(
         initial_cash=args.cash,
