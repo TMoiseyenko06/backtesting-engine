@@ -29,6 +29,8 @@ import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import streamlit as st
 
+CHECKPOINT_PATH = Path("models/nq_lstm_checkpoint.pt")
+
 # ──────────────────────────────────────────────────────────────────────────────
 # Page config  (must be the first Streamlit call)
 # ──────────────────────────────────────────────────────────────────────────────
@@ -94,14 +96,16 @@ with st.sidebar:
 # ──────────────────────────────────────────────────────────────────────────────
 # State initialisation
 # ──────────────────────────────────────────────────────────────────────────────
-if "cycle_results" not in st.session_state:
+if "cycle_results"        not in st.session_state:
     st.session_state.cycle_results: list = []
-if "bars"        not in st.session_state:
+if "bars"                 not in st.session_state:
     st.session_state.bars        = None
-if "split"       not in st.session_state:
+if "split"                not in st.session_state:
     st.session_state.split       = None
-if "data_loaded" not in st.session_state:
+if "data_loaded"          not in st.session_state:
     st.session_state.data_loaded = False
+if "best_checkpoint_acc"  not in st.session_state:
+    st.session_state.best_checkpoint_acc = 0.0
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -510,6 +514,7 @@ def run_cycle(
         batch_size=args["batch_size"],
         max_epochs=args["epochs"],
         device=device,
+        checkpoint_path=args["checkpoint_path"],
     )
     splits = walk_forward_splits(len(train_bars), n_splits=args["folds"])
     if not splits:
@@ -566,6 +571,7 @@ def run_cycle(
     _log(f"Backtest complete — {bt_result.bar_count:,} bars processed.")
 
     return {
+        "_trainer": trainer,
         "cycle":        cycle_num,
         "fold_results": fold_results,
         "elapsed":      elapsed,
@@ -623,7 +629,15 @@ if start_btn:
         cash=float(cash), contracts=float(contracts), multiplier=float(multiplier),
         init_margin=float(init_margin), maint_margin=float(maint_margin),
         symbol=symbol, cycles=int(cycles),
+        checkpoint_path=str(CHECKPOINT_PATH),
     )
+
+    if CHECKPOINT_PATH.exists():
+        st.info(
+            f"Warm-starting from saved checkpoint  "
+            f"(best val_acc so far: **{st.session_state.best_checkpoint_acc:.4f}**)",
+            icon="💾",
+        )
 
     overall_progress = st.progress(0.0, text="Starting …")
 
@@ -643,6 +657,17 @@ if start_btn:
             continue
         st.session_state.cycle_results.append(result)
         overall_progress.progress(cycle_num / int(cycles), text=f"Cycle {cycle_num} complete")
+
+        # Save best model to disk as soon as backtesting finishes
+        if result["mean_val_acc"] > st.session_state.best_checkpoint_acc:
+            CHECKPOINT_PATH.parent.mkdir(parents=True, exist_ok=True)
+            result["_trainer"].save(CHECKPOINT_PATH)
+            st.session_state.best_checkpoint_acc = result["mean_val_acc"]
+            st.success(
+                f"Checkpoint saved — new best val_acc: "
+                f"**{result['mean_val_acc']:.4f}**  →  `{CHECKPOINT_PATH}`",
+                icon="💾",
+            )
 
     overall_progress.empty()
 

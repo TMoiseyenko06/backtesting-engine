@@ -41,17 +41,18 @@ class Trainer:
 
     def __init__(
         self,
-        n_features:   int   = 22,
-        hidden_size:  int   = 64,
-        num_layers:   int   = 2,
-        dropout:      float = 0.3,
-        seq_len:      int   = 30,
-        lr:           float = 1e-3,
-        batch_size:   int   = 256,
-        max_epochs:   int   = 50,
-        patience:     int   = 7,
-        device:       Optional[str] = None,
-        weight_decay: float = 1e-4,
+        n_features:      int   = 22,
+        hidden_size:     int   = 64,
+        num_layers:      int   = 2,
+        dropout:         float = 0.3,
+        seq_len:         int   = 30,
+        lr:              float = 1e-3,
+        batch_size:      int   = 256,
+        max_epochs:      int   = 50,
+        patience:        int   = 7,
+        device:          Optional[str] = None,
+        weight_decay:    float = 1e-4,
+        checkpoint_path: Optional[str] = None,
     ) -> None:
         self.seq_len     = seq_len
         self.batch_size  = batch_size
@@ -65,6 +66,18 @@ class Trainer:
             num_layers=num_layers,
             dropout=dropout,
         ).to(self.device)
+
+        # Warm-start from checkpoint if available
+        if checkpoint_path:
+            from pathlib import Path
+            if Path(checkpoint_path).exists():
+                state = torch.load(checkpoint_path, map_location=self.device,
+                                   weights_only=True)
+                try:
+                    self.model.load_state_dict(state)
+                    print(f"  [checkpoint] Warm-started from {checkpoint_path}")
+                except RuntimeError:
+                    print(f"  [checkpoint] Architecture mismatch — starting fresh")
 
         self.optimiser = torch.optim.Adam(
             self.model.parameters(), lr=lr, weight_decay=weight_decay
