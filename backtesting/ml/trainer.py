@@ -42,12 +42,12 @@ class Trainer:
     def __init__(
         self,
         n_features:      int   = 22,
-        hidden_size:     int   = 64,
+        hidden_size:     int   = 256,
         num_layers:      int   = 2,
         dropout:         float = 0.3,
         seq_len:         int   = 30,
         lr:              float = 1e-3,
-        batch_size:      int   = 256,
+        batch_size:      int   = 1024,
         max_epochs:      int   = 50,
         patience:        int   = 7,
         device:          Optional[str] = None,
@@ -106,11 +106,13 @@ class Trainer:
 
         train_loader = DataLoader(
             train_ds, batch_size=self.batch_size, shuffle=True,
-            num_workers=0, pin_memory=(self.device == "cuda"),
+            num_workers=4, pin_memory=(self.device == "cuda"),
+            persistent_workers=True,
         )
         val_loader = DataLoader(
             val_ds, batch_size=self.batch_size, shuffle=False,
-            num_workers=0, pin_memory=(self.device == "cuda"),
+            num_workers=4, pin_memory=(self.device == "cuda"),
+            persistent_workers=True,
         )
 
         # Class weights from training labels only
