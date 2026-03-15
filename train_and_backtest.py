@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import List
 
 import numpy as np
+import torch
 
 
 # ---------------------------------------------------------------------------
@@ -305,7 +306,7 @@ def main() -> None:
     feed_test = DataFeed(test_bars, warmup_bars=warmup)
 
     strategy = LSTMSignalStrategy(
-        model=trainer.model,
+        model=trainer.model.module if isinstance(trainer.model, torch.nn.DataParallel) else trainer.model,
         device=device,
         symbol=args.symbol,
         seq_len=args.seq_len,
