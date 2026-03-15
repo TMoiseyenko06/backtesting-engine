@@ -208,6 +208,14 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--batch-size",   type=int,   default=4096, dest="batch_size")
     p.add_argument("--save-model",   default="models/nq_lstm_ohlcv1m.pt", dest="save_model")
     p.add_argument("--no-save",      action="store_true", dest="no_save")
+    p.add_argument("--max-loss",     type=float, default=2_500.0, dest="max_loss",
+                   help="Max dollar loss per trade before stop-out (default $2500)")
+    p.add_argument("--eod-hour",     type=int,   default=20, dest="eod_hour",
+                   help="UTC hour to flatten all positions / stop trading (default 20 ≈ 4 PM EDT)")
+    p.add_argument("--no-entry-hour", type=int,  default=19, dest="no_entry_hour",
+                   help="UTC hour after which no new entries are taken (default 19)")
+    p.add_argument("--min-hold-bars", type=int,  default=2, dest="min_hold_bars",
+                   help="Min bars to hold before a signal-driven exit/flip (default 2)")
     return p.parse_args()
 
 
@@ -312,6 +320,10 @@ def main() -> None:
         seq_len=args.seq_len,
         confidence_threshold=args.conf,
         contracts=args.contracts,
+        max_loss_per_trade=args.max_loss,
+        eod_hour_utc=args.eod_hour,
+        no_entry_hour_utc=args.no_entry_hour,
+        min_hold_bars=args.min_hold_bars,
     )
 
     portfolio = Portfolio(
