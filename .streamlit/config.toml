@@ -1,0 +1,12 @@
+[server]
+headless      = true          # suppress browser-open attempts on the server
+address       = "0.0.0.0"    # bind to all interfaces so the VPS is reachable
+port          = 8501
+enableCORS    = false         # let a reverse proxy (nginx) handle this if needed
+enableXsrfProtection = true
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "dark"
