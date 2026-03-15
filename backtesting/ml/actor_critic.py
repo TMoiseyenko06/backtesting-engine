@@ -9,8 +9,15 @@ Architecture
              +1          = normalised unrealised P&L
 
   Shared LSTM → LayerNorm on last hidden state
-  Policy head : Dropout → Linear(hidden, 3)   logits over {FLAT, LONG, SHORT}
-  Value  head : Dropout → Linear(hidden, 1)   scalar V(s)
+
+  Three output heads:
+    policy_head     : Dropout → Linear(hidden, 3)  — logits over {FLAT, LONG, SHORT}
+    value_head      : Dropout → Linear(hidden, 1)  — scalar V(s) for PPO critic
+    prediction_head : Dropout → Linear(hidden, 1)  — predicted H-bar forward return
+
+  The prediction head is trained with an MSE auxiliary loss (actual H-bar forward
+  return as target).  This forces the shared LSTM to encode multi-bar momentum /
+  trend information, so the policy learns to distinguish large moves from noise.
 
 Action convention (matches TradingEnv)
 --------------------------------------
@@ -18,10 +25,13 @@ Action convention (matches TradingEnv)
   1  LONG   — go / stay long
   2  SHORT  — go / stay short
 
-Serialisation
--------------
-  save(path) / load(path, device)  — saved as plain state_dict; architecture
-  dims are inferred from weight shapes on load, same as LSTMModel.
+predict_rl() returns (desired_position, confidence, predicted_return_pct):
+  desired_position : -1 (short), 0 (flat), +1 (long)
+  confidence       : max softmax probability
+  predicted_return_pct : predicted H-bar price change / current price
+                         (positive = up, negative = down)
+  The strategy uses predicted_return_pct × close × multiplier to estimate the
+  expected dollar move, then only enters trades above a minimum threshold.
 """
 
 from __future__ import annotations
@@ -79,9 +89,24 @@ class ActorCriticLSTM(nn.Module):
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
         )
+        # Predicts the H-bar forward return at each step (auxiliary task).
+        # Trained with MSE loss so the LSTM learns multi-bar price dynamics.
+        self.prediction_head = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, 1),
+        )
 
     # ------------------------------------------------------------------
-    # Batch forward — used during PPO update
+    # Hidden state extraction (shared, called by all heads)
+    # ------------------------------------------------------------------
+
+    def _encode(self, x: torch.Tensor) -> torch.Tensor:
+        """Run LSTM + LayerNorm, return last hidden state (batch, hidden)."""
+        out, _ = self.lstm(x)
+        return self.norm(out[:, -1, :])
+
+    # ------------------------------------------------------------------
+    # Batch forward — policy + value only (PPO policy gradient step)
     # ------------------------------------------------------------------
 
     def forward(
@@ -89,82 +114,79 @@ class ActorCriticLSTM(nn.Module):
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """
         x : (batch, seq_len, n_features)
-        Returns
-        -------
-        logits : (batch, n_actions)
-        values : (batch,)
+        Returns logits (batch, n_actions), values (batch,)
         """
-        out, _ = self.lstm(x)
-        h      = self.norm(out[:, -1, :])
+        h      = self._encode(x)
         logits = self.policy_head(h)
         values = self.value_head(h).squeeze(-1)
         return logits, values
 
     # ------------------------------------------------------------------
-    # Single-step forward for efficient rollout collection
+    # Full forward — all three heads (used in PPO update with aux loss)
     # ------------------------------------------------------------------
 
-    def step_hidden(
-        self,
-        x:      torch.Tensor,
-        hidden: Optional[tuple[torch.Tensor, torch.Tensor]],
-    ) -> tuple[torch.Tensor, torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
+    def forward_full(
+        self, x: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Advance the LSTM one timestep, carrying hidden state.
-
-        x      : (1, 1, n_features)   single bar
-        hidden : (h, c) or None
-        Returns: (logits (1, n_actions), values (1,), new_hidden)
+        x : (batch, seq_len, n_features)
+        Returns:
+          logits        (batch, n_actions)
+          values        (batch,)
+          pred_returns  (batch,)   — predicted H-bar forward return
         """
-        out, new_hidden = self.lstm(x, hidden)
-        h      = self.norm(out[:, -1, :])
-        logits = self.policy_head(h)
-        values = self.value_head(h).squeeze(-1)
-        return logits, values, new_hidden
+        h            = self._encode(x)
+        logits       = self.policy_head(h)
+        values       = self.value_head(h).squeeze(-1)
+        pred_returns = self.prediction_head(h).squeeze(-1)
+        return logits, values, pred_returns
 
     # ------------------------------------------------------------------
-    # Stochastic action sampling — used during rollout collection
+    # Stochastic action sampling — rollout collection
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def act(
         self, x: torch.Tensor
-    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """
-        Sample an action from the current policy (training / exploration).
+        Sample action stochastically (exploration during training).
 
-        x : (1, seq_len, n_features)  — on the correct device
-        Returns: (action, log_prob, value, entropy)  — all scalar tensors
+        x : (1, seq_len, n_features)
+        Returns: (action, log_prob, value, entropy, pred_return)  — scalar tensors
         """
-        logits, values = self.forward(x)
-        dist   = Categorical(logits=logits)
-        action = dist.sample()
-        return action, dist.log_prob(action), values, dist.entropy()
+        logits, values, pred_returns = self.forward_full(x)
+        dist    = Categorical(logits=logits)
+        action  = dist.sample()
+        return action, dist.log_prob(action), values, dist.entropy(), pred_returns
 
     # ------------------------------------------------------------------
-    # Greedy inference — for backtesting via RLTradingStrategy
+    # Greedy inference — backtesting via RLTradingStrategy
     # ------------------------------------------------------------------
 
     @torch.no_grad()
     def predict_rl(
         self, x: torch.Tensor
-    ) -> tuple[int, float]:
+    ) -> tuple[int, float, float]:
         """
         Greedy (argmax) action for deployment/backtesting.
 
-        x : (1, seq_len, n_features+2)  — state-augmented input
-        Returns: (desired_position, confidence)
-          desired_position : -1 (short), 0 (flat), +1 (long)
-          confidence       : max softmax probability
+        x : (1, seq_len, n_features+2) — state-augmented input
+        Returns:
+          desired_position  : -1 (short), 0 (flat), +1 (long)
+          confidence        : max softmax probability
+          predicted_return  : predicted H-bar forward return as a fraction of price
+                              (e.g. 0.005 = model expects +0.5% price move ahead)
         """
-        logits, _ = self.forward(x)
-        probs     = torch.softmax(logits, dim=-1)
-        ac_action = int(probs.argmax(dim=-1).item())
-        conf      = float(probs[0, ac_action].item())
+        logits, _, pred_returns = self.forward_full(x)
+        probs      = torch.softmax(logits, dim=-1)
+        ac_action  = int(probs.argmax(dim=-1).item())
+        conf       = float(probs[0, ac_action].item())
+        pred_ret   = float(pred_returns[0].item())
 
-        # TradingEnv convention: FLAT=0, LONG=1, SHORT=2  →  position {0, +1, -1}
+        # TradingEnv: FLAT=0, LONG=1, SHORT=2  →  position {0, +1, -1}
         _AC_TO_POS = {0: 0, 1: 1, 2: -1}
-        return _AC_TO_POS[ac_action], conf
+        return _AC_TO_POS[ac_action], conf, pred_ret
 
     # ------------------------------------------------------------------
     # Serialisation
@@ -178,7 +200,6 @@ class ActorCriticLSTM(nn.Module):
         if device is None:
             device = "cuda" if torch.cuda.is_available() else "cpu"
         state = torch.load(path, map_location=device, weights_only=True)
-        # Infer architecture from saved weights
         ih          = state["lstm.weight_ih_l0"]
         n_features  = ih.shape[1]
         hidden_size = ih.shape[0] // 4

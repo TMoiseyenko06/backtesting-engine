@@ -260,14 +260,16 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--no-rl", dest="rl", action="store_false",
                    help="Use supervised cross-entropy training instead of RL")
     # RL-specific
-    p.add_argument("--rl-iters",      type=int,   default=200,  dest="rl_iters",
+    p.add_argument("--rl-iters",           type=int,   default=200,  dest="rl_iters",
                    help="PPO training iterations (default 200)")
-    p.add_argument("--rl-days",       type=int,   default=16,   dest="rl_days",
+    p.add_argument("--rl-days",            type=int,   default=16,   dest="rl_days",
                    help="Episodes per PPO rollout (default 16)")
-    p.add_argument("--rl-ppo-epochs", type=int,   default=4,    dest="rl_ppo_epochs",
+    p.add_argument("--rl-ppo-epochs",      type=int,   default=4,    dest="rl_ppo_epochs",
                    help="PPO update epochs per iteration (default 4)")
-    p.add_argument("--rl-lr",         type=float, default=3e-4, dest="rl_lr",
+    p.add_argument("--rl-lr",              type=float, default=3e-4, dest="rl_lr",
                    help="PPO Adam learning rate (default 3e-4)")
+    p.add_argument("--prediction-horizon", type=int,   default=30,   dest="prediction_horizon",
+                   help="Bars ahead for the model to predict (default 30 = 30 min)")
     return p.parse_args()
 
 
@@ -350,6 +352,7 @@ def main() -> None:
             n_iterations=args.rl_iters,
             rollout_days=args.rl_days,
             ppo_epochs=args.rl_ppo_epochs,
+            prediction_horizon=args.prediction_horizon,
             device=device,
             multiplier=args.multiplier,
             commission=2.0,
@@ -379,7 +382,6 @@ def main() -> None:
             max_loss_per_trade=args.max_loss,
             eod_hour_utc=args.eod_hour,
             no_entry_hour_utc=args.no_entry_hour,
-            min_hold_bars=args.min_hold_bars,
         )
 
     else:
