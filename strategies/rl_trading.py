@@ -69,8 +69,9 @@ class RLTradingStrategy(Strategy):
         self._reward_scale  = reward_scale
         self._min_bars      = seq_len + _INDICATOR_WARMUP
 
-        # Track entry price for stop-loss calculation
+        # Track entry price and peak unrealised P&L for trailing drawdown
         self._entry_price: float = 0.0
+        self._peak_unrealised: float = 0.0
 
     def on_start(self) -> None:
         self.name = (
@@ -86,6 +87,10 @@ class RLTradingStrategy(Strategy):
         pos_after = self.position(self._symbol)
         if abs(pos_after) > 1e-9 and order.fill_price is not None:
             self._entry_price = order.fill_price
+            self._peak_unrealised = 0.0
+        else:
+            self._entry_price = 0.0
+            self._peak_unrealised = 0.0
 
     # ------------------------------------------------------------------
     # Main bar callback
@@ -107,7 +112,7 @@ class RLTradingStrategy(Strategy):
                 self.close_position(self._symbol, tag="eod_close")
             return
 
-        # ── 2. Per-trade stop-loss (hard rule) ───────────────────────
+        # ── 2. Trailing drawdown stop (hard rule) ────────────────────
         if pos != 0 and self._entry_price > 0:
             direction  = 1.0 if pos > 0 else -1.0
             unrealised = (
@@ -116,8 +121,12 @@ class RLTradingStrategy(Strategy):
                 * abs(pos)
                 * bar.contract_multiplier
             )
-            if unrealised < -self._max_loss:
-                self.close_position(self._symbol, tag="stop_loss")
+            # Update peak
+            if unrealised > self._peak_unrealised:
+                self._peak_unrealised = unrealised
+            # Stop out if we've fallen $max_loss from the peak
+            if self._peak_unrealised - unrealised >= self._max_loss:
+                self.close_position(self._symbol, tag="trailing_stop")
                 return
 
         # ── 3. No new entries near EOD ───────────────────────────────
