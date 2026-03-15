@@ -101,34 +101,31 @@ def _detect_device() -> dict:
 
 
 # ---------------------------------------------------------------------------
-# ntfy.sh push notification
+# Telegram notification
 # ---------------------------------------------------------------------------
 
-def _notify_ntfy(topic: str, analytics, elapsed: float, mode: str) -> None:
+def _notify_telegram(bot_token: str, chat_id: str, analytics, elapsed: float, mode: str) -> None:
     """
-    Send a push notification to ntfy.sh/{topic} when training + backtest finish.
-    Silently does nothing if the request fails (no crash on network issues).
+    Send a Telegram message via the Bot API when training + backtest finish.
+    Silently does nothing if the request fails — never crashes the run.
     """
-    import urllib.request, urllib.error, json as _json
+    import urllib.request, urllib.parse
     a = analytics
     msg = (
-        f"{mode} done in {elapsed:.0f}s\n"
-        f"P&L: ${a.total_return:+,.0f}  ({a.total_return_pct:+.1f}%)\n"
-        f"Trades: {a.total_trades}  Win rate: {a.win_rate:.0f}%\n"
-        f"Sharpe: {a.sharpe_ratio:.2f}  Max DD: ${a.max_drawdown:,.0f}"
+        f"*Backtest done — {mode}*\n"
+        f"Finished in {elapsed:.0f}s\n\n"
+        f"P&L: `${a.total_return:+,.0f}` ({a.total_return_pct:+.1f}%)\n"
+        f"Trades: {a.total_trades}  |  Win rate: {a.win_rate:.0f}%\n"
+        f"Sharpe: {a.sharpe_ratio:.2f}  |  Max DD: `${a.max_drawdown:,.0f}`"
     )
+    params = urllib.parse.urlencode({
+        "chat_id":    chat_id,
+        "text":       msg,
+        "parse_mode": "Markdown",
+    }).encode()
     try:
-        req = urllib.request.Request(
-            f"https://ntfy.sh/{topic}",
-            data=msg.encode(),
-            headers={
-                "Title": f"Backtest finished — {mode}",
-                "Priority": "default",
-                "Tags": "chart_with_upwards_trend",
-            },
-            method="POST",
-        )
-        urllib.request.urlopen(req, timeout=10)
+        url = f"https://api.telegram.org/bot{bot_token}/sendMessage"
+        urllib.request.urlopen(urllib.request.Request(url, data=params), timeout=10)
     except Exception:
         pass   # notification is best-effort; never crash the run
 
@@ -303,8 +300,10 @@ def _parse_args() -> argparse.Namespace:
                    help="PPO Adam learning rate (default 3e-4)")
     p.add_argument("--prediction-horizon", type=int,   default=30,   dest="prediction_horizon",
                    help="Bars ahead for the model to predict (default 30 = 30 min)")
-    p.add_argument("--ntfy-topic",         default="",               dest="ntfy_topic",
-                   help="ntfy.sh topic to push a notification to when finished (optional)")
+    p.add_argument("--tg-token",   default="", dest="tg_token",
+                   help="Telegram bot token (from @BotFather)")
+    p.add_argument("--tg-chat",    default="", dest="tg_chat",
+                   help="Telegram chat ID to send notifications to")
     p.add_argument("--compile",            action="store_true",      dest="compile_model",
                    help="Enable torch.compile for fused CUDA kernels (PyTorch >= 2.0, ~10-30%% speedup)")
     return p.parse_args()
@@ -499,12 +498,12 @@ def main() -> None:
     _print_backtest_section(result.analytics, args.symbol, len(test_bars), b_start, b_end)
     print()
 
-    # ── 8. Push notification ───────────────────────────────────────────────
-    if args.ntfy_topic:
+    # ── 8. Telegram notification ───────────────────────────────────────────
+    if args.tg_token and args.tg_chat:
         total_elapsed = time.time() - t0
         mode_label = "PPO-RL" if args.rl else "Supervised"
-        _notify_ntfy(args.ntfy_topic, result.analytics, total_elapsed, mode_label)
-        print(f"  Notification sent to ntfy.sh/{args.ntfy_topic}")
+        _notify_telegram(args.tg_token, args.tg_chat, result.analytics, total_elapsed, mode_label)
+        print(f"  Notification sent to Telegram chat {args.tg_chat}")
 
 
 if __name__ == "__main__":
