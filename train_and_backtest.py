@@ -25,8 +25,8 @@ Options
     --conf          Minimum signal confidence 0-1 (default: 0.50)
     --folds         Walk-forward training folds (default: 3)
     --epochs        Max training epochs per fold (default: 50)
-    --hidden        LSTM hidden size (default: 64)
-    --batch-size    Training batch size (default: 256)
+    --hidden        LSTM hidden size (default: 512)
+    --batch-size    Training batch size (default: 4096)
     --save-model    Path to save the trained model .pt file
                     (default: models/nq_lstm_ohlcv1m.pt)
     --no-save       Skip saving the model to disk
@@ -61,10 +61,11 @@ def _detect_device() -> dict:
             "device": "cpu", "name": "CPU", "vram_gb": None}
 
     if torch.cuda.is_available():
-        info["device"] = "cuda"
-        info["name"]   = torch.cuda.get_device_name(0)
+        info["device"]  = "cuda"
+        info["n_gpus"]  = torch.cuda.device_count()
+        info["name"]    = torch.cuda.get_device_name(0)
         props = torch.cuda.get_device_properties(0)
-        info["vram_gb"] = round(props.total_memory / 1024 ** 3, 1)
+        info["vram_gb"]      = round(props.total_memory / 1024 ** 3, 1)
         info["cuda_version"] = torch.version.cuda or "n/a"
         info["compute_cap"]  = f"{props.major}.{props.minor}"
     elif torch.backends.mps.is_available():
@@ -94,12 +95,15 @@ def _kv(key: str, value: str, indent: int = 12) -> str:
 
 def _print_device_section(info: dict) -> None:
     if info["device"] == "cuda":
-        vram = f"  ({info['vram_gb']} GB VRAM)"
+        n    = info.get("n_gpus", 1)
+        vram = info['vram_gb']
         cap  = info.get("compute_cap", "")
         print(_section("DEVICE"))
-        print(_kv("GPU :", f"NVIDIA {info['name']}{vram}"))
+        gpu_label = f"{n}x " if n > 1 else ""
+        print(_kv("GPU :", f"{gpu_label}NVIDIA {info['name']}  "
+                           f"({vram} GB VRAM each  ·  {vram * n:.0f} GB total)"))
         print(_kv("",      f"CUDA {info['cuda_version']}  ·  Compute {cap}  "
-                           f"·  PyTorch {info['torch_version']}"))
+                           f"·  PyTorch {info['torch_version']}  ·  BF16 AMP"))
     elif info["device"] == "mps":
         print(_section("DEVICE"))
         print(_kv("GPU :", f"Apple MPS  ·  PyTorch {info['torch_version']}"))
@@ -199,8 +203,8 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--conf",         type=float, default=0.50)
     p.add_argument("--folds",        type=int,   default=3)
     p.add_argument("--epochs",       type=int,   default=50)
-    p.add_argument("--hidden",       type=int,   default=64)
-    p.add_argument("--batch-size",   type=int,   default=256, dest="batch_size")
+    p.add_argument("--hidden",       type=int,   default=512)
+    p.add_argument("--batch-size",   type=int,   default=4096, dest="batch_size")
     p.add_argument("--save-model",   default="models/nq_lstm_ohlcv1m.pt", dest="save_model")
     p.add_argument("--no-save",      action="store_true", dest="no_save")
     return p.parse_args()

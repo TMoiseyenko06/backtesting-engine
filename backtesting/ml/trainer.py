@@ -7,6 +7,9 @@ Features
   - Early stopping on validation loss
   - LR scheduling (ReduceLROnPlateau)
   - Per-fold metrics printed to stdout
+  - Multi-GPU via DataParallel (auto-detected)
+  - BF16 Automatic Mixed Precision (H200 / Ampere+ native)
+  - torch.compile for fused CUDA kernels (PyTorch >= 2.0)
 """
 
 from __future__ import annotations
@@ -26,41 +29,50 @@ class Trainer:
     """
     Parameters
     ----------
-    n_features  : int
-    hidden_size : int
-    num_layers  : int
-    dropout     : float
-    seq_len     : int
-    lr          : float    initial learning rate
-    batch_size  : int
-    max_epochs  : int
-    patience    : int      early-stopping patience (epochs without val improvement)
-    device      : str | None  auto-detected if None
-    weight_decay: float    L2 regularisation
+    n_features   : int
+    hidden_size  : int
+    num_layers   : int
+    dropout      : float
+    seq_len      : int
+    lr           : float    initial learning rate
+    batch_size   : int      total batch across all GPUs
+    max_epochs   : int
+    patience     : int      early-stopping patience (epochs without val improvement)
+    device       : str | None  auto-detected if None
+    weight_decay : float    L2 regularisation
+    num_workers  : int      DataLoader worker processes per loader
+    compile_model: bool     torch.compile (PyTorch >= 2.0, disabled by default for safety)
     """
 
     def __init__(
         self,
         n_features:      int   = 22,
-        hidden_size:     int   = 256,
+        hidden_size:     int   = 512,
         num_layers:      int   = 2,
         dropout:         float = 0.3,
         seq_len:         int   = 30,
         lr:              float = 1e-3,
-        batch_size:      int   = 1024,
+        batch_size:      int   = 4096,
         max_epochs:      int   = 50,
         patience:        int   = 7,
         device:          Optional[str] = None,
         weight_decay:    float = 1e-4,
         checkpoint_path: Optional[str] = None,
+        num_workers:     int   = 8,
+        compile_model:   bool  = False,
     ) -> None:
-        self.seq_len     = seq_len
-        self.batch_size  = batch_size
-        self.max_epochs  = max_epochs
-        self.patience    = patience
-        self.device      = device or _auto_device()
+        self.seq_len      = seq_len
+        self.batch_size   = batch_size
+        self.max_epochs   = max_epochs
+        self.patience     = patience
+        self.num_workers  = num_workers
+        self.device       = device or _auto_device()
 
-        self.model = LSTMModel(
+        # ── AMP: use BF16 on CUDA (H200 / Ampere+ have native BF16 tensor cores)
+        self._use_amp  = (self.device == "cuda")
+        self._amp_dtype = torch.bfloat16
+
+        base_model = LSTMModel(
             n_features=n_features,
             hidden_size=hidden_size,
             num_layers=num_layers,
@@ -74,10 +86,27 @@ class Trainer:
                 state = torch.load(checkpoint_path, map_location=self.device,
                                    weights_only=True)
                 try:
-                    self.model.load_state_dict(state)
+                    base_model.load_state_dict(state)
                     print(f"  [checkpoint] Warm-started from {checkpoint_path}")
                 except RuntimeError:
                     print(f"  [checkpoint] Architecture mismatch — starting fresh")
+
+        # ── torch.compile (PyTorch 2.0+, fuses CUDA kernels)
+        if compile_model:
+            try:
+                base_model = torch.compile(base_model)
+                print("  [compile] torch.compile enabled")
+            except Exception as e:
+                print(f"  [compile] skipped: {e}")
+
+        # ── Multi-GPU DataParallel
+        n_gpus = torch.cuda.device_count() if self.device == "cuda" else 1
+        if n_gpus > 1:
+            self.model = nn.DataParallel(base_model)
+            print(f"  [multi-gpu] DataParallel across {n_gpus} GPUs  "
+                  f"(effective batch = {batch_size}  ·  {batch_size // n_gpus} per GPU)")
+        else:
+            self.model = base_model
 
         self.optimiser = torch.optim.Adam(
             self.model.parameters(), lr=lr, weight_decay=weight_decay
@@ -106,13 +135,13 @@ class Trainer:
 
         train_loader = DataLoader(
             train_ds, batch_size=self.batch_size, shuffle=True,
-            num_workers=4, pin_memory=(self.device == "cuda"),
-            persistent_workers=True,
+            num_workers=self.num_workers, pin_memory=(self.device == "cuda"),
+            persistent_workers=(self.num_workers > 0),
         )
         val_loader = DataLoader(
             val_ds, batch_size=self.batch_size, shuffle=False,
-            num_workers=4, pin_memory=(self.device == "cuda"),
-            persistent_workers=True,
+            num_workers=self.num_workers, pin_memory=(self.device == "cuda"),
+            persistent_workers=(self.num_workers > 0),
         )
 
         # Class weights from training labels only
@@ -143,8 +172,10 @@ class Trainer:
                 best_val_acc  = val_acc
                 best_epoch    = epoch
                 no_improve    = 0
-                best_state    = {k: v.cpu().clone()
-                                 for k, v in self.model.state_dict().items()}
+                # Save weights from the underlying module (unwrap DataParallel)
+                src = self.model.module if isinstance(self.model, nn.DataParallel) \
+                      else self.model
+                best_state = {k: v.cpu().clone() for k, v in src.state_dict().items()}
             else:
                 no_improve += 1
 
@@ -161,7 +192,9 @@ class Trainer:
 
         # Restore best weights
         if best_state is not None:
-            self.model.load_state_dict(
+            target = self.model.module if isinstance(self.model, nn.DataParallel) \
+                     else self.model
+            target.load_state_dict(
                 {k: v.to(self.device) for k, v in best_state.items()}
             )
 
@@ -176,7 +209,9 @@ class Trainer:
         }
 
     def save(self, path) -> None:
-        self.model.save(path)
+        # Always save from the underlying module, not the DataParallel wrapper
+        m = self.model.module if isinstance(self.model, nn.DataParallel) else self.model
+        m.save(path)
 
     # ------------------------------------------------------------------
 
@@ -187,12 +222,16 @@ class Trainer:
         training: bool,
     ) -> tuple[float, float]:
         self.model.train(training)
-        total_loss  = 0.0
+        total_loss    = 0.0
         total_correct = 0
         total_samples = 0
 
-        ctx = torch.enable_grad() if training else torch.no_grad()
-        with ctx:
+        grad_ctx = torch.enable_grad() if training else torch.no_grad()
+        amp_ctx  = torch.cuda.amp.autocast(
+            enabled=self._use_amp, dtype=self._amp_dtype
+        )
+
+        with grad_ctx, amp_ctx:
             for x, y in loader:
                 x = x.to(self.device, non_blocking=True)
                 y = y.to(self.device, non_blocking=True)
