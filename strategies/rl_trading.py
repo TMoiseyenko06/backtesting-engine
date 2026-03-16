@@ -23,6 +23,8 @@ The ONLY hard rules enforced here are non-negotiable structural controls:
 
 from __future__ import annotations
 
+from collections import deque
+
 import numpy as np
 
 from backtesting.data_feed import Bar
@@ -56,6 +58,8 @@ class RLTradingStrategy(Strategy):
         eod_hour_utc: int      = 20,
         no_entry_hour_utc: int = 19,
         reward_scale: float    = 100.0,
+        max_loss: float        = 2_500.0,
+        multiplier: float      = 20.0,
     ) -> None:
         super().__init__()
         self._model         = model
@@ -66,6 +70,8 @@ class RLTradingStrategy(Strategy):
         self._eod_hour      = eod_hour_utc
         self._no_entry_hour = no_entry_hour_utc
         self._reward_scale  = reward_scale
+        self._max_loss      = max_loss
+        self._multiplier    = multiplier
         self._min_bars      = seq_len + _INDICATOR_WARMUP
 
         # Bracket order state
@@ -74,6 +80,10 @@ class RLTradingStrategy(Strategy):
         self._tp_order_id:    str | None  = None
         self._pending_sl_pts: float       = 0.0
         self._pending_tp_pts: float       = 0.0
+
+        # Rolling history for train-consistent pos/upnl state encoding
+        self._pos_hist:  deque[float] = deque(maxlen=seq_len)
+        self._upnl_hist: deque[float] = deque(maxlen=seq_len)
 
     def on_start(self) -> None:
         self.name = f"RL-PPO-Bracket(seq={self._seq_len},intraday)"
@@ -89,7 +99,12 @@ class RLTradingStrategy(Strategy):
         if abs(pos) > 1e-9 and not self._in_bracket and order.fill_price is not None:
             entry     = order.fill_price
             direction = 1.0 if pos > 0 else -1.0
-            sl_price  = entry - direction * self._pending_sl_pts
+
+            # Hard-cap SL distance so max loss per trade ≤ max_loss dollars
+            max_sl_pts = self._max_loss / (self._contracts * self._multiplier)
+            sl_pts     = min(self._pending_sl_pts, max_sl_pts)
+
+            sl_price  = entry - direction * sl_pts
             tp_price  = entry + direction * self._pending_tp_pts
 
             if pos > 0:
@@ -140,8 +155,20 @@ class RLTradingStrategy(Strategy):
         if self.bars_available < self._min_bars:
             return
 
-        pos      = self.position(self._symbol)
+        pos_obj  = self.position_obj(self._symbol)
+        pos      = pos_obj.quantity
         bar_hour = bar.timestamp.hour   # Databento timestamps are UTC
+
+        # ── Update rolling pos/upnl history on every bar (mirrors training) ──
+        direction = 1.0 if pos > 0 else (-1.0 if pos < 0 else 0.0)
+        if abs(pos) > 1e-9 and pos_obj.avg_entry_price > 0.0:
+            upnl_raw = ((bar.close - pos_obj.avg_entry_price)
+                        * pos * self._multiplier / self._reward_scale)
+            upnl_scaled = float(np.clip(upnl_raw, -10.0, 10.0))
+        else:
+            upnl_scaled = 0.0
+        self._pos_hist.append(direction)
+        self._upnl_hist.append(upnl_scaled)
 
         # ── 1. EOD forced flat ────────────────────────────────────────
         if bar_hour >= self._eod_hour:
@@ -163,12 +190,18 @@ class RLTradingStrategy(Strategy):
             return
 
         # ── 4. Build augmented state (matches TradingEnv training) ────
-        # pos should be 0 here (not in bracket, guaranteed by step 2)
         hist     = self.history(self._min_bars)
         features = make_features(hist)[-self._seq_len:]      # (seq_len, 22)
 
-        pos_enc  = np.zeros((self._seq_len, 1), dtype=np.float32)   # always flat here
-        upnl_arr = np.zeros((self._seq_len, 1), dtype=np.float32)
+        # Use rolling history so the model sees the same pos/upnl distribution
+        # it trained on (non-zero during bracket holds, 0 when flat).
+        pad = self._seq_len - len(self._pos_hist)
+        pos_enc  = np.array(
+            [0.0] * pad + list(self._pos_hist), dtype=np.float32
+        ).reshape(-1, 1)
+        upnl_arr = np.array(
+            [0.0] * pad + list(self._upnl_hist), dtype=np.float32
+        ).reshape(-1, 1)
 
         x_aug = np.concatenate([features, pos_enc, upnl_arr], axis=-1)  # (seq_len, 24)
         x_t   = torch.tensor(x_aug, dtype=torch.float32).unsqueeze(0).to(self._device)

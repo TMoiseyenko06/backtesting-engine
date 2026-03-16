@@ -426,6 +426,8 @@ def main() -> None:
             contracts=args.contracts,
             eod_hour_utc=args.eod_hour,
             no_entry_hour_utc=args.no_entry_hour,
+            max_loss=args.max_loss,
+            multiplier=args.multiplier,
         )
 
     else:
