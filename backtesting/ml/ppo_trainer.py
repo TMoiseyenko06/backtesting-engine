@@ -107,8 +107,8 @@ class PPOTrainer:
         gamma:               float = 0.99,
         gae_lambda:          float = 0.95,
         value_loss_coef:     float = 0.25,   # reduced: return normalisation makes value loss O(1)
-        entropy_coef:        float = 0.01,   # higher → more exploration, prevents FLAT collapse
-        flat_penalty:        float = 0.0,    # dollar cost per flat bar (0 = off)
+        entropy_coef:        float = 0.05,   # higher → more exploration, prevents FLAT collapse
+        flat_penalty:        float = 1.0,    # dollar cost per flat bar — same order as commission
         pred_loss_coef:      float = 0.01,   # reduced: auxiliary task should not dominate policy
         prediction_horizon:  int   = 30,      # H-bar ahead prediction target
         max_grad_norm:       float = 0.5,

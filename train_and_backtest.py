@@ -48,8 +48,8 @@ Options (RL-specific)
     --rl-days       Episodes (trading days) per PPO rollout (default: 16)
     --rl-ppo-epochs PPO update epochs per iteration (default: 4)
     --rl-lr         PPO Adam learning rate (default: 3e-4)
-    --entropy-coef  Entropy bonus (default: 0.01) — prevents FLAT collapse
-    --flat-penalty  Dollar cost per flat bar (default: 0.0) — incentivises trading frequency
+    --entropy-coef  Entropy bonus (default: 0.05) — prevents FLAT collapse
+    --flat-penalty  Dollar cost per flat bar (default: 1.0) — incentivises trading frequency
                     Start with 0.5–1.0 for ~5 trades/day; same scale as commission ($2/side)
 
 Options (supervised-specific)
@@ -318,11 +318,11 @@ def _parse_args() -> argparse.Namespace:
                    help="PPO update epochs per iteration (default 4)")
     p.add_argument("--rl-lr",              type=float, default=3e-4, dest="rl_lr",
                    help="PPO Adam learning rate (default 3e-4)")
-    p.add_argument("--entropy-coef",       type=float, default=0.01, dest="entropy_coef",
-                   help="PPO entropy bonus coefficient — higher prevents FLAT collapse (default 0.01)")
-    p.add_argument("--flat-penalty",       type=float, default=0.0,  dest="flat_penalty",
+    p.add_argument("--entropy-coef",       type=float, default=0.05, dest="entropy_coef",
+                   help="PPO entropy bonus coefficient — higher prevents FLAT collapse (default 0.05)")
+    p.add_argument("--flat-penalty",       type=float, default=1.0,  dest="flat_penalty",
                    help="Dollar penalty per flat bar during training — incentivises more trading "
-                        "(0=off; try 0.5–2.0 for ~5 trades/day; same scale as commission)")
+                        "(default 1.0; same scale as commission)")
     p.add_argument("--prediction-horizon", type=int,   default=30,   dest="prediction_horizon",
                    help="Bars ahead for the model to predict (default 30 = 30 min)")
     p.add_argument("--weight-decay",       type=float, default=1e-4, dest="weight_decay",
@@ -459,6 +459,12 @@ def main() -> None:
 
             trained_model = ppo_trainer._policy   # bare ActorCriticLSTM
             trained_model.eval()                  # disable dropout for deterministic inference
+
+        # ── Model fingerprint — confirms weights changed between runs ──
+        import torch as _torch
+        _wsum = sum(float(p.detach().cpu().sum()) for p in trained_model.parameters())
+        print(f"  Model fingerprint (weight sum): {_wsum:.6f}")
+        print(f"  (This should differ across training runs — if identical, weights are not updating)\n")
 
         # ── 6a. Backtest (RL) ─────────────────────────────────────────
         warmup   = args.seq_len + 60

@@ -19,6 +19,8 @@ The ONLY hard rules enforced here are non-negotiable structural controls:
   - No flip       : since a position is always managed by a live bracket, the
                     model cannot reverse while in a trade.  It must wait for the
                     bracket to resolve before entering the opposite direction.
+  - Bankruptcy    : trading halts if equity falls below ``bankruptcy_floor``
+                    (default 10% of initial cash) to prevent unbounded losses.
 """
 
 from __future__ import annotations
@@ -46,6 +48,8 @@ class RLTradingStrategy(Strategy):
     eod_hour_utc      : int              UTC hour to flatten everything.
     no_entry_hour_utc : int              UTC hour to block new entries.
     reward_scale      : float            Must match PPOTrainer.reward_scale.
+    bankruptcy_floor  : float            Stop trading if equity drops below this
+                                         fraction of initial cash (default 0.10).
     """
 
     def __init__(
@@ -60,6 +64,7 @@ class RLTradingStrategy(Strategy):
         reward_scale: float    = 100.0,
         max_loss: float        = 2_500.0,
         multiplier: float      = 20.0,
+        bankruptcy_floor: float = 0.10,
     ) -> None:
         super().__init__()
         self._model         = model
@@ -72,6 +77,7 @@ class RLTradingStrategy(Strategy):
         self._reward_scale  = reward_scale
         self._max_loss      = max_loss
         self._multiplier    = multiplier
+        self._bankruptcy_floor = bankruptcy_floor
         self._min_bars      = seq_len + _INDICATOR_WARMUP
 
         # Bracket order state
@@ -85,8 +91,21 @@ class RLTradingStrategy(Strategy):
         self._pos_hist:  deque[float] = deque(maxlen=seq_len)
         self._upnl_hist: deque[float] = deque(maxlen=seq_len)
 
+        # Action distribution counters (for on_stop summary)
+        self._act_flat:  int = 0
+        self._act_long:  int = 0
+        self._act_short: int = 0
+
+        # Per-trade log: (entry_time, entry_price, sl_price, tp_price, direction)
+        self._pending_trade_info: tuple | None = None
+
+        # Bankruptcy guard: set True once equity falls below floor
+        self._bankrupt: bool = False
+        self._initial_cash: float | None = None
+
     def on_start(self) -> None:
         self.name = f"RL-PPO-Bracket(seq={self._seq_len},intraday)"
+        self._initial_cash = self.cash()
 
     # ------------------------------------------------------------------
     # Fill callback — OCO bracket management
@@ -134,6 +153,13 @@ class RLTradingStrategy(Strategy):
             self._tp_order_id = tp_order.order_id
             self._in_bracket  = True
 
+            dir_str = "LONG" if pos > 0 else "SHORT"
+            print(
+                f"  [TRADE OPEN ] {order.filled_at}  {dir_str}  "
+                f"entry={entry:.2f}  SL={sl_price:.2f}({sl_pts:.1f}pts)  "
+                f"TP={tp_price:.2f}({self._pending_tp_pts:.1f}pts)"
+            )
+
         # ── Bracket exit: SL or TP fired → cancel the surviving leg ───
         elif self._in_bracket and abs(pos) < 1e-9:
             if self._sl_order_id:
@@ -143,6 +169,12 @@ class RLTradingStrategy(Strategy):
             self._sl_order_id = None
             self._tp_order_id = None
             self._in_bracket  = False
+
+            tag = order.tag if order.tag else "?"
+            print(
+                f"  [TRADE CLOSE] {order.filled_at}  exit={order.fill_price:.2f}  "
+                f"tag={tag}  equity={self.equity():.0f}"
+            )
 
     # ------------------------------------------------------------------
     # Main bar callback
@@ -158,6 +190,28 @@ class RLTradingStrategy(Strategy):
         pos_obj  = self.position_obj(self._symbol)
         pos      = pos_obj.quantity
         bar_hour = bar.timestamp.hour   # Databento timestamps are UTC
+
+        # ── Bankruptcy guard ───────────────────────────────────────────
+        if self._initial_cash is not None and not self._bankrupt:
+            current_equity = self.equity()
+            floor = self._initial_cash * self._bankruptcy_floor
+            if current_equity < floor:
+                self._bankrupt = True
+                if self._in_bracket or pos != 0:
+                    self.cancel_all(self._symbol)
+                    if pos != 0:
+                        self.close_position(self._symbol, tag="bankruptcy_stop")
+                    self._in_bracket  = False
+                    self._sl_order_id = None
+                    self._tp_order_id = None
+                print(
+                    f"  [BANKRUPTCY ] {bar.timestamp}  equity={current_equity:.0f} "
+                    f"< floor={floor:.0f} — trading halted"
+                )
+                return
+
+        if self._bankrupt:
+            return
 
         # ── Update rolling pos/upnl history on every bar (mirrors training) ──
         direction = 1.0 if pos > 0 else (-1.0 if pos < 0 else 0.0)
@@ -202,6 +256,10 @@ class RLTradingStrategy(Strategy):
                     self._in_bracket  = False
                     self._sl_order_id = None
                     self._tp_order_id = None
+                    print(
+                        f"  [HARD STOP  ] {bar.timestamp}  upnl={upnl:.0f}  "
+                        f"entry={pos_obj.avg_entry_price:.2f}  close={bar.close:.2f}"
+                    )
             return
 
         # ── 3. No new entries near EOD ────────────────────────────────
@@ -229,7 +287,13 @@ class RLTradingStrategy(Strategy):
         desired_pos, _confidence, sl_pts, tp_pts = self._model.predict_rl(x_t)
 
         if desired_pos == 0:
+            self._act_flat += 1
             return  # flat signal, stay flat
+
+        if desired_pos == 1:
+            self._act_long += 1
+        else:
+            self._act_short += 1
 
         # ── 6. Submit market entry (bracket placed in on_fill) ────────
         _max_sl = self._max_loss / (self._contracts * self._multiplier)
@@ -240,3 +304,26 @@ class RLTradingStrategy(Strategy):
             self.buy(self._symbol, self._contracts, tag="rl_long")
         else:
             self.sell(self._symbol, self._contracts, tag="rl_short")
+
+    # ------------------------------------------------------------------
+    # End-of-backtest summary
+    # ------------------------------------------------------------------
+
+    def on_stop(self) -> None:
+        total = self._act_flat + self._act_long + self._act_short
+        if total == 0:
+            print("  [RL Strategy] No bars processed after warm-up.")
+            return
+        print(
+            f"\n  ── RL Strategy Action Distribution ──────────────────────\n"
+            f"  FLAT : {self._act_flat:>7,}  ({100*self._act_flat/total:.1f}%)\n"
+            f"  LONG : {self._act_long:>7,}  ({100*self._act_long/total:.1f}%)\n"
+            f"  SHORT: {self._act_short:>7,}  ({100*self._act_short/total:.1f}%)\n"
+            f"  Total decision bars: {total:,}\n"
+            f"  ─────────────────────────────────────────────────────────"
+        )
+        if self._act_long + self._act_short == 0:
+            print(
+                "  WARNING: model predicted FLAT on every bar — policy may have collapsed.\n"
+                "  Try: --entropy-coef 0.1 --flat-penalty 2.0"
+            )

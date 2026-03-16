@@ -283,10 +283,6 @@ class BatchedTradingEnv:
         mtm     = ((effective_price - self._prev_closes)
                    * self._positions.astype(np.float32)
                    * self.contracts * self.multiplier)
-        # Flat penalty: small cost per bar for doing nothing, scaled by reward_scale
-        flat_cost = (self._positions == 0).astype(np.float32) * self.flat_penalty
-        rewards = (mtm - exit_commission - flat_cost) / self.reward_scale
-
         # ── 3. Update bracket state after exits ────────────────────────
         post_exit_pos   = np.where(bracket_exit, np.int32(0),     self._positions)
         post_exit_entry = np.where(bracket_exit, np.float32(0.0), self._entry_prices)
@@ -310,6 +306,12 @@ class BatchedTradingEnv:
         new_sl     = np.where(can_enter, sl_price_new,  post_exit_sl)
         new_tp     = np.where(can_enter, tp_price_new,  post_exit_tp)
         new_in_b   = post_exit_in_b | can_enter
+
+        # Flat penalty: only charge when the model chose to stay flat this bar
+        # (not on entry bars — those already pay commission).
+        # Re-compute using can_enter so entry bars are excluded.
+        flat_cost = ((post_exit_pos == 0) & ~can_enter).astype(np.float32) * self.flat_penalty
+        rewards   = (mtm - exit_commission - flat_cost) / self.reward_scale
 
         # Entry commission
         rewards -= (can_enter.astype(np.float32)
