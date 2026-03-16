@@ -182,6 +182,15 @@ class RLTradingStrategy(Strategy):
             return
 
         # ── 2. In bracket — model is ignored, orders manage the trade ─
+        #    Guard: a margin call can force-close the position without
+        #    triggering on_fill, leaving _in_bracket stale.  Detect this
+        #    and reset so the strategy can enter new trades.
+        if self._in_bracket and abs(pos) < 1e-9:
+            self.cancel_all(self._symbol)
+            self._in_bracket  = False
+            self._sl_order_id = None
+            self._tp_order_id = None
+
         #    Per-bar hard stop: if bracket SL somehow fails to execute,
         #    this guarantees we never lose more than max_loss dollars.
         if self._in_bracket:

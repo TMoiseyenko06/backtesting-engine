@@ -458,6 +458,7 @@ def main() -> None:
             _print_rl_train_section(rl_metrics, model_path, elapsed)
 
             trained_model = ppo_trainer._policy   # bare ActorCriticLSTM
+            trained_model.eval()                  # disable dropout for deterministic inference
 
         # ── 6a. Backtest (RL) ─────────────────────────────────────────
         warmup   = args.seq_len + 60
