@@ -296,20 +296,22 @@ def _build_test_episodes(
         if len(idx) <= seq_len:
             continue
         f = features[idx].astype(np.float32)
-        p = np.array([bars[i].close for i in idx], dtype=np.float32)
-        h = np.array([bars[i].high  for i in idx], dtype=np.float32)
-        l = np.array([bars[i].low   for i in idx], dtype=np.float32)
+        p = np.array([bars[i].close     for i in idx], dtype=np.float32)
+        h = np.array([bars[i].high      for i in idx], dtype=np.float32)
+        l = np.array([bars[i].low       for i in idx], dtype=np.float32)
+        t = [bars[i].timestamp          for i in idx]
         n = len(p)
         fwd = np.zeros(n, dtype=np.float32)
         for i in range(n - H):
             if p[i] > 0:
                 fwd[i] = (p[i + H] - p[i]) / p[i]
-        episodes.append((f, p, h, l, fwd))
+        episodes.append((f, p, h, l, fwd, t))
     return episodes
 
 
 def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
-                 device: str, initial_cash: float):
+                 device: str, initial_cash: float,
+                 trade_log_path: str | None = None):
     """
     Run the trained model greedily on every test episode using BatchedTradingEnv.
     Identical evaluation logic to PPOTrainer._evaluate_val(), run day-by-day so
@@ -318,6 +320,7 @@ def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
     Returns an analytics object with the same attributes used by
     _print_backtest_section() and _notify_telegram().
     """
+    import csv
     import torch
     from backtesting.ml.rl_env import BatchedTradingEnv
 
@@ -329,15 +332,25 @@ def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
 
     daily_pnls: list[float] = []
     trade_pnls: list[float] = []
+    trade_log:  list[dict]  = []
     n_trades = 0
 
     for episode in test_episodes:
+        # Episodes are 6-tuples: (features, closes, highs, lows, fwd_returns, timestamps)
+        ep_data       = episode[:5]
+        ep_timestamps = episode[5] if len(episode) == 6 else None
+
         env    = BatchedTradingEnv(n_envs=1, **bt_kwargs)
-        states = env.reset_all([episode])
+        states = env.reset_all([ep_data])
 
         day_pnl       = 0.0
         in_trade      = False
         trade_pnl_acc = 0.0
+        entry_ts      = None
+        entry_price   = 0.0
+        entry_dir     = 0
+        entry_sl      = 0.0
+        entry_tp      = 0.0
 
         with torch.no_grad():
             while True:
@@ -357,6 +370,10 @@ def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
                     directions.astype(np.int32), sl_arr, tp_arr
                 )
 
+                # cursor was incremented inside step_all; bar just processed is cursor-1
+                bar_idx = int(env._cursors[0]) - 1
+                bar_ts  = ep_timestamps[bar_idx] if ep_timestamps is not None else None
+
                 rew_dollars = float(rews[0]) * reward_scale
                 day_pnl    += rew_dollars
 
@@ -366,22 +383,69 @@ def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
                     if in_trade:
                         # Previous bracket closed AND new entry in same bar
                         trade_pnls.append(trade_pnl_acc)
+                        trade_log.append({
+                            "entry_time":  entry_ts,
+                            "exit_time":   bar_ts,
+                            "direction":   "LONG" if entry_dir == 1 else "SHORT",
+                            "entry_price": entry_price,
+                            "sl_price":    entry_sl,
+                            "tp_price":    entry_tp,
+                            "exit_type":   "EOD",
+                            "pnl":         round(trade_pnl_acc, 2),
+                        })
                     in_trade      = True
                     trade_pnl_acc = rew_dollars          # includes -entry_commission
+                    entry_ts      = bar_ts
+                    entry_price   = float(env._entry_prices[0])
+                    entry_dir     = int(directions[0])
+                    entry_sl      = float(env._sl_prices[0])
+                    entry_tp      = float(env._tp_prices[0])
                 elif in_trade:
                     trade_pnl_acc += rew_dollars
                     if env._positions[0] == 0:           # SL/TP hit → bracket closed
+                        exit_type = "TP" if trade_pnl_acc > 0 else "SL"
                         trade_pnls.append(trade_pnl_acc)
+                        trade_log.append({
+                            "entry_time":  entry_ts,
+                            "exit_time":   bar_ts,
+                            "direction":   "LONG" if entry_dir == 1 else "SHORT",
+                            "entry_price": entry_price,
+                            "sl_price":    entry_sl,
+                            "tp_price":    entry_tp,
+                            "exit_type":   exit_type,
+                            "pnl":         round(trade_pnl_acc, 2),
+                        })
                         in_trade      = False
                         trade_pnl_acc = 0.0
 
                 if dones[0]:
                     if in_trade:                         # EOD forced flat
                         trade_pnls.append(trade_pnl_acc)
+                        trade_log.append({
+                            "entry_time":  entry_ts,
+                            "exit_time":   bar_ts,
+                            "direction":   "LONG" if entry_dir == 1 else "SHORT",
+                            "entry_price": entry_price,
+                            "sl_price":    entry_sl,
+                            "tp_price":    entry_tp,
+                            "exit_type":   "EOD",
+                            "pnl":         round(trade_pnl_acc, 2),
+                        })
                         in_trade = False
                     break
 
         daily_pnls.append(day_pnl)
+
+    # ── Write trade log to CSV ─────────────────────────────────────────────
+    if trade_log_path and trade_log:
+        Path(trade_log_path).parent.mkdir(parents=True, exist_ok=True)
+        fields = ["entry_time", "exit_time", "direction",
+                  "entry_price", "sl_price", "tp_price", "exit_type", "pnl"]
+        with open(trade_log_path, "w", newline="") as fh:
+            writer = csv.DictWriter(fh, fieldnames=fields)
+            writer.writeheader()
+            writer.writerows(trade_log)
+        print(f"  Trade log saved → {trade_log_path}  ({len(trade_log)} trades)")
 
     # ── Analytics ─────────────────────────────────────────────────────────
     daily_arr  = np.array(daily_pnls, dtype=np.float64)
@@ -512,6 +576,9 @@ def _parse_args() -> argparse.Namespace:
                    help="Telegram bot token — overrides TELEGRAM_BOT_TOKEN in .env")
     p.add_argument("--tg-chat",    default=os.environ.get("TELEGRAM_CHAT_ID", ""),   dest="tg_chat",
                    help="Telegram chat ID — overrides TELEGRAM_CHAT_ID in .env")
+    p.add_argument("--trade-log",          type=str,   default="logs/trade_log.csv", dest="trade_log",
+                   metavar="PATH",
+                   help="CSV file to write per-trade log after backtesting (default: logs/trade_log.csv)")
     p.add_argument("--compile",            action="store_true",      dest="compile_model",
                    help="Enable torch.compile for fused CUDA kernels (PyTorch >= 2.0, ~10-30%% speedup)")
     return p.parse_args()
@@ -654,7 +721,8 @@ def main() -> None:
         )
         print(f"  {len(test_episodes)} test-set trading days", flush=True)
         print("  Running NN backtest on test set …", flush=True)
-        analytics = _nn_backtest(trained_model, test_episodes, env_kwargs, device, args.cash)
+        analytics = _nn_backtest(trained_model, test_episodes, env_kwargs, device, args.cash,
+                                  trade_log_path=args.trade_log)
 
     else:
         # ── Supervised walk-forward training ─────────────────────────
