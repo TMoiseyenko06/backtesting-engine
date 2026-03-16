@@ -1,5 +1,6 @@
 """
-PPO (Proximal Policy Optimization) trainer for intraday futures trading.
+PPO (Proximal Policy Optimization) trainer for intraday futures trading
+with bracket orders.
 
 Training objective
 ------------------
@@ -7,37 +8,38 @@ Training objective
              - entropy_coef × entropy bonus
              + pred_loss_coef × MSE(predicted_H_bar_return, actual_H_bar_return)
 
-The last term (auxiliary prediction loss) forces the shared LSTM to learn
-multi-bar price dynamics.  The LSTM hidden state must simultaneously support:
-  1. A good trading policy (PPO)
-  2. Accurate H-bar forward return prediction (MSE)
+  The PPO clip loss uses a *combined* log probability:
+    log_prob = log_prob_direction + entered_bracket × (log_prob_sl + log_prob_tp)
 
-This teaches the network to recognise setups where a BIG move is coming and
-stay flat when no meaningful move is predicted.  The entropy bonus discourages
-the policy from churning on every bar; commission costs in the environment
-further penalise excessive trading.
+  This means SL and TP are trained only on steps where the model actually
+  opened a bracket (entered_bracket=True).  On hold/flat steps, only the
+  direction head is trained.
+
+Bracket order model
+-------------------
+  When the model selects LONG or SHORT, it simultaneously predicts:
+    sl_pts : stop-loss distance in NQ points (range [25, 500])
+    tp_pts : take-profit distance in NQ points (range [25, 1500])
+
+  The entry + SL + TP are submitted together.  The model is ignored while
+  a bracket is open — the trade exits automatically when SL or TP is hit
+  intrabar (checked via HIGH/LOW).
 
 Training loop (per iteration)
 ------------------------------
   1. Sample ``rollout_days`` random trading-day episodes.
   2. Roll out the current policy, collecting per-step:
-       obs, action, log_prob, value, reward, done, actual_fwd_return
+       obs, action, sl_sample, tp_sample, log_prob (combined),
+       entered_bracket, value, reward, done, actual_fwd_return
   3. Compute GAE advantages and discounted returns.
   4. Run ``ppo_epochs`` mini-batch updates using the full loss above.
   5. Print progress every ``print_every`` iterations.
-
-Prediction horizon
-------------------
-``prediction_horizon`` (default 30 bars) sets H.  For 1-min bars this means the
-model learns to predict the 30-minute ahead price change.  Increasing H makes
-the model focus on longer multi-bar swings; decreasing H makes it more reactive.
 
 Multi-GPU
 ---------
 DataParallel is used for the PPO update step.  Rollout collection is
 vectorised: all rollout_days episodes are stepped in lock-step, batching
-their observations into a single GPU forward pass at every bar, so both GPUs
-are fed during inference as well as during the update.
+their observations into a single GPU forward pass at every bar.
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ from typing import List, Optional
 import numpy as np
 import torch
 import torch.nn as nn
+from torch.distributions import Categorical, Normal
 from torch.utils.data import DataLoader, TensorDataset
 
 from backtesting.data_feed import Bar
@@ -159,9 +162,6 @@ class PPOTrainer:
         )
 
         # ── H200: scale hidden_size BEFORE model construction ────────────
-        # LSTM(hidden=512) forward on H200 ≈ 0.2ms < Python overhead ≈ 0.4ms
-        # → GPU idles 67% of each rollout step.  4× hidden makes GPU the
-        # bottleneck (≈0.8ms compute) so utilisation rises to ~65-75%.
         if _is_h200:
             hidden_size = hidden_size * 4   # 512 → 2048
             print(f"  [H200] hidden_size scaled to {hidden_size}")
@@ -185,11 +185,6 @@ class PPOTrainer:
         else:
             self.model = base_model
 
-        # ── H200 auto-scale ──────────────────────────────────────────────────
-        # hidden=512 LSTM forward on H200 takes ~0.2ms but Python overhead
-        # per rollout step is ~0.4ms, leaving the GPU idle 67% of each cycle.
-        # Scaling hidden 4× makes GPU compute the bottleneck again.
-        # rollout_days / minibatch / ppo_epochs scale fills the update pipeline.
         if _is_h200:
             self.rollout_days   = rollout_days   * 32   # 16   → 512 episodes
             self.minibatch_size = self.minibatch_size * 8   # → 8192 effective
@@ -221,9 +216,6 @@ class PPOTrainer:
             raise ValueError("No valid training episodes found (all days too short).")
 
         # ── Train / validation split (random, by day) ─────────────────────
-        # Hold out val_frac of days to detect memorisation vs generalisation.
-        # Episodes are self-contained (one calendar day each) so random
-        # splitting does not introduce look-ahead bias.
         rng = random.Random(42)
         eps_shuffled = list(episodes)
         rng.shuffle(eps_shuffled)
@@ -240,7 +232,7 @@ class PPOTrainer:
         )
 
         best_val_pnl   = -float("inf")
-        best_state     = None          # model weights at best val performance
+        best_state     = None
         iters_no_improve = 0
 
         last_metrics: dict = {}
@@ -287,7 +279,6 @@ class PPOTrainer:
                     )
                     break
 
-        # Restore the checkpoint that performed best on the validation set
         if best_state is not None:
             self._policy.load_state_dict(
                 {k: v.to(self.device) for k, v in best_state.items()}
@@ -305,14 +296,14 @@ class PPOTrainer:
 
     def _make_episodes(
         self, bars: List[Bar], features: np.ndarray
-    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray]]:
+    ) -> list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]]:
         """
         Group bar indices by UTC calendar date.
-        Returns list of (features, prices, forward_returns) tuples.
+        Returns list of (features, closes, highs, lows, forward_returns) tuples.
 
-        forward_returns[i] = (prices[i + H] - prices[i]) / prices[i]
-          = the fraction of price change H bars ahead (zero-padded near EOD).
-        This is the auxiliary regression target the model is trained to predict.
+        forward_returns[i] = (closes[i + H] - closes[i]) / closes[i]
+          = fraction price change H bars ahead (auxiliary regression target).
+        highs and lows are required for intrabar SL/TP simulation in step_all().
         """
         day_map: dict = defaultdict(list)
         for i, bar in enumerate(bars):
@@ -326,6 +317,8 @@ class PPOTrainer:
                 continue
             f = features[idx].astype(np.float32)
             p = np.array([bars[i].close for i in idx], dtype=np.float32)
+            h = np.array([bars[i].high  for i in idx], dtype=np.float32)
+            l = np.array([bars[i].low   for i in idx], dtype=np.float32)
 
             # H-bar forward returns (regression target)
             n = len(p)
@@ -334,7 +327,7 @@ class PPOTrainer:
                 if p[i] > 0:
                     fwd[i] = (p[i + H] - p[i]) / p[i]
 
-            episodes.append((f, p, fwd))
+            episodes.append((f, p, h, l, fwd))
         return episodes
 
     # ------------------------------------------------------------------
@@ -344,24 +337,37 @@ class PPOTrainer:
     def _evaluate_val(self, val_episodes: list) -> float:
         """
         Run the current policy greedily on val_episodes.
-        Returns mean daily PnL in dollars (same units as mean_episode_pnl).
+        Returns mean daily PnL in dollars.
         """
         self._policy.eval()
-        n_ep       = len(val_episodes)
-        env        = BatchedTradingEnv(n_envs=n_ep, **self._env_kwargs)
-        all_states = env.reset_all(val_episodes)
+        n_ep        = len(val_episodes)
+        env         = BatchedTradingEnv(n_envs=n_ep, **self._env_kwargs)
+        all_states  = env.reset_all(val_episodes)
         active_mask = np.ones(n_ep, dtype=bool)
         ep_rets     = np.zeros(n_ep, dtype=np.float32)
 
         with torch.no_grad():
             while active_mask.any():
-                active  = np.where(active_mask)[0]
-                x       = torch.from_numpy(all_states[active]).to(self.device)
-                logits, _, _ = self._policy(x)
-                actions_np   = logits.argmax(dim=-1).cpu().numpy()
-                actions_all  = np.zeros(n_ep, dtype=np.int64)
-                actions_all[active] = actions_np
-                all_states, rews, dones = env.step_all(actions_all)
+                active = np.where(active_mask)[0]
+                x      = torch.from_numpy(all_states[active]).to(self.device)
+
+                logits, _, _, sl_mean, tp_mean = self._policy(x)
+                actions_np = logits.argmax(dim=-1).cpu().numpy()
+                sl_np      = sl_mean.cpu().numpy()
+                tp_np      = tp_mean.cpu().numpy()
+
+                # Map action ints to directions
+                directions_np = np.where(actions_np == 1, np.int32(1),
+                                np.where(actions_np == 2, np.int32(-1), np.int32(0)))
+
+                directions_all = np.zeros(n_ep, dtype=np.int32)
+                sl_all         = np.zeros(n_ep, dtype=np.float32)
+                tp_all         = np.zeros(n_ep, dtype=np.float32)
+                directions_all[active] = directions_np
+                sl_all        [active] = sl_np
+                tp_all        [active] = tp_np
+
+                all_states, rews, dones, _ = env.step_all(directions_all, sl_all, tp_all)
                 ep_rets     += rews * active_mask.astype(np.float32)
                 active_mask &= ~dones
 
@@ -372,7 +378,8 @@ class PPOTrainer:
     # ------------------------------------------------------------------
 
     def _collect_rollout(
-        self, episodes: list[tuple[np.ndarray, np.ndarray, np.ndarray]]
+        self,
+        episodes: list[tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]],
     ) -> dict:
         """
         Sample ``rollout_days`` episodes and collect trajectories.
@@ -380,75 +387,96 @@ class PPOTrainer:
         Uses BatchedTradingEnv so all active episodes are stepped with a
         single numpy call.  All per-step bookkeeping uses numpy advanced
         indexing into pre-allocated 2D arrays — zero Python loops in the
-        hot path.  The remaining Python loops run ~max_bars (≈400) and
-        ~n_ep (≈512) iterations each, vs the previous ~n_ep×max_bars
-        (≈200K) iterations per Python dict-append loop.
+        hot path.
+
+        The combined log_prob for PPO is:
+          log_prob = log_prob_dir + entered_bracket * (log_prob_sl + log_prob_tp)
+
+        This means sl/tp heads only receive gradients on bracket-entry steps.
         """
         self._policy.eval()
 
         sampled  = random.choices(episodes, k=self.rollout_days)
         n_ep     = len(sampled)
-        max_bars = max(len(f) for f, _, _ in sampled)
+        max_bars = max(len(f) for f, *_ in sampled)
 
         # Pre-compute forward-return matrix for vectorised lookup
         fwd_arr = np.zeros((n_ep, max_bars), dtype=np.float32)
-        for i, (_, _, fwd) in enumerate(sampled):
+        for i, (*_, fwd) in enumerate(sampled):
             fwd_arr[i, :len(fwd)] = fwd
 
         state_dim = self._env_kwargs["n_features"] + TradingEnv.N_EXTRA
 
-        # Pre-allocated 2D stores (n_ep × max_bars) — written with numpy
-        # fancy indexing; no Python loops in the hot path.
-        obs_store  = np.zeros((n_ep, max_bars, self.seq_len, state_dim), dtype=np.float32)
-        act_store  = np.zeros((n_ep, max_bars),                          dtype=np.int64)
-        rew_store  = np.zeros((n_ep, max_bars),                          dtype=np.float32)
-        done_store = np.zeros((n_ep, max_bars),                          dtype=bool)
-        fret_store = np.zeros((n_ep, max_bars),                          dtype=np.float32)
-        lp_store   = np.zeros((n_ep, max_bars),                          dtype=np.float32)
-        val_store  = np.zeros((n_ep, max_bars),                          dtype=np.float32)
-        pr_store   = np.zeros((n_ep, max_bars),                          dtype=np.float32)
+        # Pre-allocated 2D stores (n_ep × max_bars)
+        obs_store     = np.zeros((n_ep, max_bars, self.seq_len, state_dim), dtype=np.float32)
+        act_store     = np.zeros((n_ep, max_bars),                          dtype=np.int64)
+        sl_store      = np.zeros((n_ep, max_bars),                          dtype=np.float32)
+        tp_store      = np.zeros((n_ep, max_bars),                          dtype=np.float32)
+        rew_store     = np.zeros((n_ep, max_bars),                          dtype=np.float32)
+        done_store    = np.zeros((n_ep, max_bars),                          dtype=bool)
+        fret_store    = np.zeros((n_ep, max_bars),                          dtype=np.float32)
+        entered_store = np.zeros((n_ep, max_bars),                          dtype=bool)
+        lp_dir_store  = np.zeros((n_ep, max_bars),                          dtype=np.float32)
+        lp_sl_store   = np.zeros((n_ep, max_bars),                          dtype=np.float32)
+        lp_tp_store   = np.zeros((n_ep, max_bars),                          dtype=np.float32)
+        val_store     = np.zeros((n_ep, max_bars),                          dtype=np.float32)
+        pr_store      = np.zeros((n_ep, max_bars),                          dtype=np.float32)
 
-        ep_t    = np.zeros(n_ep, dtype=np.int32)    # steps taken per episode
+        ep_t    = np.zeros(n_ep, dtype=np.int32)
         ep_rets = np.zeros(n_ep, dtype=np.float32)
 
         env        = BatchedTradingEnv(n_envs=n_ep, **self._env_kwargs)
-        all_states = env.reset_all(sampled)          # (n_ep, seq_len, state_dim)
+        all_states = env.reset_all(sampled)
 
         active_mask = np.ones(n_ep, dtype=bool)
         cursors     = np.full(n_ep, self.seq_len, dtype=np.int32)
 
-        # GPU tensors accumulated; bulk-transferred after the loop (3 syncs total)
-        gpu_log_probs : list[torch.Tensor] = []
-        gpu_values    : list[torch.Tensor] = []
-        gpu_pred_rets : list[torch.Tensor] = []
-        active_hist   : list[np.ndarray]   = []   # active episode indices per step
-        steps_hist    : list[np.ndarray]   = []   # ep_t snapshot per step
+        # GPU tensors accumulated; bulk-transferred after the loop (3 syncs)
+        gpu_lp_dir   : list[torch.Tensor] = []
+        gpu_lp_sl    : list[torch.Tensor] = []
+        gpu_lp_tp    : list[torch.Tensor] = []
+        gpu_sl       : list[torch.Tensor] = []
+        gpu_tp       : list[torch.Tensor] = []
+        gpu_values   : list[torch.Tensor] = []
+        gpu_pred_rets: list[torch.Tensor] = []
+        active_hist  : list[np.ndarray]   = []
+        steps_hist   : list[np.ndarray]   = []
 
         with torch.no_grad():
             while active_mask.any():
-                active   = np.where(active_mask)[0]   # (n_active,)
-                curr     = all_states[active]          # (n_active, seq_len, state_dim)
-                t_active = ep_t[active]                # (n_active,) — step index per ep
+                active   = np.where(active_mask)[0]
+                curr     = all_states[active]
+                t_active = ep_t[active]
 
                 # ── GPU forward: one batched call for all active episodes ──
                 x = torch.from_numpy(curr).to(self.device)
-                logits, values_t, pred_rets = self._policy(x)
-                dist      = torch.distributions.Categorical(logits=logits)
-                actions_t = dist.sample()
-                log_prob  = dist.log_prob(actions_t)
+                (actions_t, lp_dir_t, lp_sl_t, lp_tp_t,
+                 sl_t, tp_t, values_t, _, pred_rets) = self._policy.act(x)
 
-                gpu_log_probs.append(log_prob)
-                gpu_values.append(values_t)
+                gpu_lp_dir   .append(lp_dir_t)
+                gpu_lp_sl    .append(lp_sl_t)
+                gpu_lp_tp    .append(lp_tp_t)
+                gpu_sl       .append(sl_t)
+                gpu_tp       .append(tp_t)
+                gpu_values   .append(values_t)
                 gpu_pred_rets.append(pred_rets)
-                active_hist.append(active)
-                steps_hist.append(t_active.copy())
+                active_hist  .append(active)
+                steps_hist   .append(t_active.copy())
 
-                # ONE sync per step — only actions need to reach CPU now
-                actions_np = actions_t.cpu().numpy()   # (n_active,)
+                # ONE sync per step: actions + sl/tp needed on CPU for env
+                actions_np = actions_t.cpu().numpy()
+                sl_np      = sl_t.cpu().numpy()
+                tp_np      = tp_t.cpu().numpy()
 
-                # ── Vectorised stores: numpy fancy indexing, zero loops ───
+                # Map action ints {0,1,2} → directions {0,+1,-1}
+                directions_np = np.where(actions_np == 1, np.int32(1),
+                                np.where(actions_np == 2, np.int32(-1), np.int32(0)))
+
+                # ── Vectorised stores: numpy fancy indexing ───────────────
                 obs_store [active, t_active] = curr
                 act_store [active, t_active] = actions_np
+                sl_store  [active, t_active] = sl_np
+                tp_store  [active, t_active] = tp_np
                 fret_store[active, t_active] = np.where(
                     cursors[active] < fwd_arr.shape[1],
                     fwd_arr[active, cursors[active]],
@@ -457,60 +485,90 @@ class PPOTrainer:
                 ep_t[active]    += 1
                 cursors[active] += 1
 
-                # ── Vectorised env step ──────────────────────────────────
-                actions_all         = np.zeros(n_ep, dtype=np.int64)
-                actions_all[active] = actions_np
-                all_states, rews, dones = env.step_all(actions_all)
+                # ── Vectorised env step ───────────────────────────────────
+                directions_all = np.zeros(n_ep, dtype=np.int32)
+                sl_all         = np.zeros(n_ep, dtype=np.float32)
+                tp_all         = np.zeros(n_ep, dtype=np.float32)
+                directions_all[active] = directions_np
+                sl_all        [active] = sl_np
+                tp_all        [active] = tp_np
 
-                rew_store [active, t_active] = rews [active]
-                done_store[active, t_active] = dones[active]
+                all_states, rews, dones, entered_b = env.step_all(
+                    directions_all, sl_all, tp_all
+                )
+
+                rew_store    [active, t_active] = rews    [active]
+                done_store   [active, t_active] = dones   [active]
+                entered_store[active, t_active] = entered_b[active]
                 ep_rets += rews * active_mask.astype(np.float32)
 
                 active_mask &= ~dones
 
         # ── Bulk GPU→CPU: 3 syncs total for the entire rollout ──────────
-        all_lp = torch.cat(gpu_log_probs).cpu().numpy()
-        all_v  = torch.cat(gpu_values).cpu().numpy()
-        all_pr = torch.cat(gpu_pred_rets).cpu().numpy()
+        all_lp_dir = torch.cat(gpu_lp_dir   ).cpu().numpy()
+        all_lp_sl  = torch.cat(gpu_lp_sl    ).cpu().numpy()
+        all_lp_tp  = torch.cat(gpu_lp_tp    ).cpu().numpy()
+        all_sl     = torch.cat(gpu_sl        ).cpu().numpy()
+        all_tp     = torch.cat(gpu_tp        ).cpu().numpy()
+        all_v      = torch.cat(gpu_values    ).cpu().numpy()
+        all_pr     = torch.cat(gpu_pred_rets ).cpu().numpy()
 
-        # Scatter log_probs / values / pred_rets into 2D stores.
-        # ~max_bars loop iters (≈400) — not n_ep×max_bars (≈200K).
+        # Scatter into 2D stores (~max_bars iterations, not n_ep×max_bars)
         offset = 0
         for act_step, t_step in zip(active_hist, steps_hist):
             n = len(act_step)
-            lp_store [act_step, t_step] = all_lp[offset:offset + n]
-            val_store[act_step, t_step] = all_v [offset:offset + n]
-            pr_store [act_step, t_step] = all_pr[offset:offset + n]
+            lp_dir_store[act_step, t_step] = all_lp_dir[offset:offset + n]
+            lp_sl_store [act_step, t_step] = all_lp_sl [offset:offset + n]
+            lp_tp_store [act_step, t_step] = all_lp_tp [offset:offset + n]
+            val_store   [act_step, t_step] = all_v     [offset:offset + n]
+            pr_store    [act_step, t_step] = all_pr    [offset:offset + n]
             offset += n
 
         # ── Flatten in episode order for correct GAE boundaries ─────────
-        # ~n_ep loop iters (≈512) — not n_ep×T (≈200K).
-        obs_c = []; act_c = []; lp_c  = []; val_c = []
+        obs_c = []; act_c = []; sl_c  = []; tp_c  = []
         rew_c = []; don_c = []; frt_c = []; prd_c = []
+        ent_c = []; lpd_c = []; lps_c = []; lpt_c = []
+        val_c = []
+
         for i in range(n_ep):
             T = int(ep_t[i])
             if T == 0:
                 continue
-            obs_c.append(obs_store [i, :T])
-            act_c.append(act_store [i, :T])
-            lp_c .append(lp_store  [i, :T])
-            val_c.append(val_store [i, :T])
-            rew_c.append(rew_store [i, :T])
-            don_c.append(done_store[i, :T])
-            frt_c.append(fret_store[i, :T])
-            prd_c.append(pr_store  [i, :T])
+            obs_c.append(obs_store    [i, :T])
+            act_c.append(act_store    [i, :T])
+            sl_c .append(sl_store     [i, :T])
+            tp_c .append(tp_store     [i, :T])
+            rew_c.append(rew_store    [i, :T])
+            don_c.append(done_store   [i, :T])
+            frt_c.append(fret_store   [i, :T])
+            prd_c.append(pr_store     [i, :T])
+            ent_c.append(entered_store[i, :T])
+            lpd_c.append(lp_dir_store [i, :T])
+            lps_c.append(lp_sl_store  [i, :T])
+            lpt_c.append(lp_tp_store  [i, :T])
+            val_c.append(val_store    [i, :T])
 
-        fwd_np  = np.concatenate(frt_c, axis=0)
-        pred_np = np.concatenate(prd_c, axis=0)
+        fwd_np      = np.concatenate(frt_c, axis=0)
+        pred_np     = np.concatenate(prd_c, axis=0)
+        entered_np  = np.concatenate(ent_c, axis=0)
+        lp_dir_np   = np.concatenate(lpd_c, axis=0)
+        lp_sl_np    = np.concatenate(lps_c, axis=0)
+        lp_tp_np    = np.concatenate(lpt_c, axis=0)
+
+        # Combined log_prob: direction + entered*(sl+tp)
+        combined_lp = lp_dir_np + entered_np.astype(np.float32) * (lp_sl_np + lp_tp_np)
 
         return {
             "obs":                np.concatenate(obs_c, axis=0).astype(np.float32),
             "actions":            np.concatenate(act_c, axis=0).astype(np.int64),
-            "log_probs":          np.concatenate(lp_c,  axis=0).astype(np.float32),
+            "sl_samples":         np.concatenate(sl_c,  axis=0).astype(np.float32),
+            "tp_samples":         np.concatenate(tp_c,  axis=0).astype(np.float32),
+            "log_probs":          combined_lp.astype(np.float32),
             "values":             np.concatenate(val_c, axis=0).astype(np.float32),
             "rewards":            np.concatenate(rew_c, axis=0).astype(np.float32),
             "dones":              np.concatenate(don_c, axis=0),
             "actual_fwd_rets":    fwd_np,
+            "entered_bracket":    entered_np,
             "episode_returns":    ep_rets.tolist(),
             "pred_return_errors": np.abs(pred_np - fwd_np),
         }
@@ -546,52 +604,42 @@ class PPOTrainer:
         Full PPO loss including auxiliary prediction MSE:
           L = -L_clip + c_v * L_value - c_e * L_entropy + c_p * L_pred
 
-        Returns normalisation
-        ---------------------
-        Raw GAE returns share the same scale as the (possibly diverging) value
-        function, creating a positive-feedback loop that drives value loss into
-        the tens of thousands.  We break this by normalising the return targets
-        to zero mean / unit std before any gradient flows through the value head.
-        The policy gradient is unaffected (advantages are normalised separately).
+        Combined log_prob for the PPO ratio:
+          log_prob = log_prob_dir + entered_bracket * (log_prob_sl + log_prob_tp)
 
-        Value clipping
-        --------------
-        Standard PPO value clipping prevents large one-step updates that would
-        push the value function far from its previous estimate, complementing
-        the return normalisation to keep value loss in the O(0.5–2.0) range.
+        SL and TP log_probs only contribute for bracket-entry steps, so the
+        sl/tp heads only receive policy gradients when a trade is actually opened.
         """
         self.model.train()
 
         # ── Normalise returns BEFORE building tensors ─────────────────────
-        # This is the primary fix for value loss divergence.  raw returns
-        # share the value function's scale (can be 10k+); after normalisation
-        # every mini-batch target has mean≈0 std≈1, so value loss starts at
-        # O(1) and converges quickly instead of spiralling to 48 000+.
         rets_np       = rollout["returns"].astype(np.float32)
         ret_mean      = float(rets_np.mean())
         ret_std       = float(rets_np.std()) + 1e-8
         norm_rets_np  = (rets_np - ret_mean) / ret_std
 
-        # Old value estimates normalised with the SAME stats so value-clipping
-        # comparison is in the same normalised space.
         old_vals_norm_np = (
             rollout["values"].astype(np.float32) - ret_mean
         ) / ret_std
 
-        obs           = torch.tensor(rollout["obs"],              device=self.device)
-        actions       = torch.tensor(rollout["actions"],          device=self.device)
-        old_lp        = torch.tensor(rollout["log_probs"],        device=self.device)
-        norm_returns  = torch.tensor(norm_rets_np,                device=self.device)
-        old_vals_norm = torch.tensor(old_vals_norm_np,            device=self.device)
-        advantages    = torch.tensor(rollout["advantages"],       device=self.device)
-        actual_fwd    = torch.tensor(rollout["actual_fwd_rets"],  device=self.device)
+        obs           = torch.tensor(rollout["obs"],             device=self.device)
+        actions       = torch.tensor(rollout["actions"],         device=self.device)
+        sl_samples    = torch.tensor(rollout["sl_samples"],      device=self.device)
+        tp_samples    = torch.tensor(rollout["tp_samples"],      device=self.device)
+        entered       = torch.tensor(rollout["entered_bracket"], device=self.device)
+        old_lp        = torch.tensor(rollout["log_probs"],       device=self.device)
+        norm_returns  = torch.tensor(norm_rets_np,               device=self.device)
+        old_vals_norm = torch.tensor(old_vals_norm_np,           device=self.device)
+        advantages    = torch.tensor(rollout["advantages"],      device=self.device)
+        actual_fwd    = torch.tensor(rollout["actual_fwd_rets"], device=self.device)
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         dataset = TensorDataset(
-            obs, actions, old_lp, norm_returns, old_vals_norm, advantages, actual_fwd
+            obs, actions, sl_samples, tp_samples, entered,
+            old_lp, norm_returns, old_vals_norm, advantages, actual_fwd,
         )
-        loader  = DataLoader(dataset, batch_size=self.minibatch_size, shuffle=True)
+        loader = DataLoader(dataset, batch_size=self.minibatch_size, shuffle=True)
 
         amp_ctx = torch.amp.autocast(
             device_type="cuda" if self.device == "cuda" else "cpu",
@@ -602,18 +650,28 @@ class PPOTrainer:
         tot_policy = tot_value = tot_entropy = tot_pred = tot_clip = 0.0
         n_batches  = 0
 
-        for batch_obs, batch_act, batch_old_lp, batch_norm_ret, batch_old_val_norm, batch_adv, batch_fwd in loader:
+        for (batch_obs, batch_act, batch_sl, batch_tp, batch_entered,
+             batch_old_lp, batch_norm_ret, batch_old_val_norm,
+             batch_adv, batch_fwd) in loader:
+
             self.optimiser.zero_grad()
 
             with amp_ctx:
-                # self.model is either the base model or nn.DataParallel —
-                # forward() now returns all three heads so DataParallel can
-                # scatter/gather across both GPUs correctly.
-                logits, values, pred_returns = self.model(batch_obs)
+                logits, values, pred_returns, sl_mean, tp_mean = self.model(batch_obs)
 
-                dist      = torch.distributions.Categorical(logits=logits)
-                new_lp    = dist.log_prob(batch_act)
-                entropy   = dist.entropy().mean()
+                # Discrete direction distribution
+                dir_dist   = Categorical(logits=logits)
+                new_lp_dir = dir_dist.log_prob(batch_act)
+                entropy    = dir_dist.entropy().mean()
+
+                # Continuous SL/TP distributions (use policy's learnable std)
+                sl_std = self._policy.sl_log_std.exp().clamp(1.0, 200.0)
+                tp_std = self._policy.tp_log_std.exp().clamp(1.0, 400.0)
+                new_lp_sl = Normal(sl_mean, sl_std).log_prob(batch_sl)
+                new_lp_tp = Normal(tp_mean, tp_std).log_prob(batch_tp)
+
+                # Combined log_prob: sl/tp only count on bracket-entry steps
+                new_lp = new_lp_dir + batch_entered.float() * (new_lp_sl + new_lp_tp)
 
                 ratio     = torch.exp(new_lp - batch_old_lp)
                 clip_frac = float(((ratio - 1.0).abs() > self.clip_eps).float().mean().item())
@@ -622,9 +680,7 @@ class PPOTrainer:
                 surr2  = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * batch_adv
                 l_clip = -torch.min(surr1, surr2).mean()
 
-                # Value loss with clipping (PPO standard).
-                # Both values and targets are in normalised space (mean=0 std=1)
-                # so value loss should remain O(0.5–2.0) throughout training.
+                # Value loss with clipping (PPO standard)
                 v_clipped = batch_old_val_norm + torch.clamp(
                     values - batch_old_val_norm, -self.clip_eps, self.clip_eps
                 )
@@ -642,7 +698,6 @@ class PPOTrainer:
                     + self.pred_loss_coef  * l_pred
                 )
 
-            # GradScaler is a no-op when AMP is disabled (enabled=False)
             self._scaler.scale(loss).backward()
             self._scaler.unscale_(self.optimiser)
             nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
