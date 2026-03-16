@@ -91,13 +91,9 @@ class ActorCriticLSTM(nn.Module):
         )
         # Predicts the H-bar forward return at each step (auxiliary task).
         # Trained with MSE loss so the LSTM learns multi-bar price dynamics.
-        # Tanh bounds output to [-1, 1]; without it the unbounded linear head
-        # produces O(1) predictions against O(0.001) fractional-return targets,
-        # giving MSE in the tens of thousands that drowns the policy gradient.
         self.prediction_head = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
-            nn.Tanh(),
         )
 
     # ------------------------------------------------------------------

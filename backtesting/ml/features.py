@@ -130,11 +130,7 @@ def make_features(bars: List[Bar]) -> np.ndarray:
         pir = (c - l) / rng if rng > 0 else 0.5
 
         # ── Volume ───────────────────────────────────────────────────── #
-        # Normalise log-volume relative to rolling mean so it stays on the
-        # same scale (~[-1, 1]) as all other features.  Raw log1p(volume)
-        # for futures is ≈7–12, 100× larger than price/return features,
-        # which saturates LSTM cell states and prevents convergence.
-        log_vol  = (np.log1p(volumes[i]) / np.log1p(vol20[i]) - 1.0) if vol20[i] > 0 else 0.0
+        log_vol  = np.log1p(volumes[i])
         vol_rat  = (volumes[i] / vol20[i]) if vol20[i] > 0 else 1.0
 
         # ── RSI ──────────────────────────────────────────────────────── #
