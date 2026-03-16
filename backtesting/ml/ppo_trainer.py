@@ -150,13 +150,19 @@ class PPOTrainer:
         )
         self._env = TradingEnv(**self._env_kwargs)   # kept for external callers
 
-        # ── AMP — LSTM shields itself to float32, linear heads use BF16/FP16
-        _is_h200 = (
-            self.device == "cuda" and torch.cuda.is_available() and
-            "H200" in torch.cuda.get_device_name(0)
+        # ── GPU detection ─────────────────────────────────────────────────
+        _gpu_name = (
+            torch.cuda.get_device_name(0)
+            if self.device == "cuda" and torch.cuda.is_available()
+            else ""
         )
+        _is_h200 = "H200" in _gpu_name
+        _is_a100 = "A100" in _gpu_name
+
+        # ── AMP — LSTM shields itself to float32, linear heads use BF16/FP16
+        # Both H200 and A100 support BF16 natively; use FP16 on older GPUs.
         self._use_amp   = (self.device == "cuda")
-        self._amp_dtype = torch.bfloat16 if _is_h200 else torch.float16
+        self._amp_dtype = torch.bfloat16 if (_is_h200 or _is_a100) else torch.float16
         self._scaler    = torch.amp.GradScaler(
             device="cuda", enabled=self._use_amp
         )
@@ -165,6 +171,11 @@ class PPOTrainer:
         if _is_h200:
             hidden_size = hidden_size * 4   # 512 → 2048
             print(f"  [H200] hidden_size scaled to {hidden_size}")
+
+        # ── A100: scale hidden_size BEFORE model construction ────────────
+        elif _is_a100:
+            hidden_size = hidden_size * 2   # 512 → 1024
+            print(f"  [A100] hidden_size scaled to {hidden_size}")
 
         base_model = ActorCriticLSTM(
             n_features=n_features + TradingEnv.N_EXTRA,
@@ -191,6 +202,15 @@ class PPOTrainer:
             self.ppo_epochs     = ppo_epochs * 2            # 4    → 8 epochs
             print(
                 f"  [H200] auto-scale: rollout_days={self.rollout_days}  "
+                f"minibatch={self.minibatch_size}  ppo_epochs={self.ppo_epochs}"
+            )
+
+        elif _is_a100:
+            self.rollout_days   = rollout_days   * 8    # 16  → 128 episodes
+            self.minibatch_size = self.minibatch_size * 8   # 512 → 4096
+            self.ppo_epochs     = max(ppo_epochs, 6)        # 4   → 6 epochs
+            print(
+                f"  [A100] auto-scale: rollout_days={self.rollout_days}  "
                 f"minibatch={self.minibatch_size}  ppo_epochs={self.ppo_epochs}"
             )
 
