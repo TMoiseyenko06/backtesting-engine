@@ -300,6 +300,12 @@ def _parse_args() -> argparse.Namespace:
                    help="PPO Adam learning rate (default 3e-4)")
     p.add_argument("--prediction-horizon", type=int,   default=30,   dest="prediction_horizon",
                    help="Bars ahead for the model to predict (default 30 = 30 min)")
+    p.add_argument("--weight-decay",       type=float, default=1e-4, dest="weight_decay",
+                   help="Adam L2 weight decay / regularisation (default 1e-4)")
+    p.add_argument("--val-frac",           type=float, default=0.15, dest="val_frac",
+                   help="Fraction of training days held out for validation (default 0.15)")
+    p.add_argument("--patience",           type=int,   default=80,   dest="patience",
+                   help="Early-stop after this many iters with no val improvement (default 80, 0=off)")
     p.add_argument("--tg-token",   default="", dest="tg_token",
                    help="Telegram bot token (from @BotFather)")
     p.add_argument("--tg-chat",    default="", dest="tg_chat",
@@ -394,6 +400,9 @@ def main() -> None:
             commission=2.0,
             contracts=args.contracts,
             max_loss=args.max_loss,
+            weight_decay=args.weight_decay,
+            val_frac=args.val_frac,
+            patience=args.patience,
         )
         rl_metrics = ppo_trainer.fit(train_bars, features)
         elapsed = time.time() - t0

@@ -101,8 +101,8 @@ class PPOTrainer:
         gamma:               float = 0.99,
         gae_lambda:          float = 0.95,
         value_loss_coef:     float = 0.5,
-        entropy_coef:        float = 0.02,    # slightly higher → stay flat more
-        pred_loss_coef:      float = 1.0,     # aux prediction loss weight
+        entropy_coef:        float = 0.05,    # higher → more exploration, prevents policy collapse
+        pred_loss_coef:      float = 0.3,     # lower → less memorisation of specific returns
         prediction_horizon:  int   = 30,      # H-bar ahead prediction target
         max_grad_norm:       float = 0.5,
         print_every:         int   = 10,
@@ -112,6 +112,9 @@ class PPOTrainer:
         contracts:           float = 1.0,
         max_loss:            float = 2_500.0,
         reward_scale:        float = 100.0,
+        weight_decay:        float = 1e-4,    # L2 regularisation — penalises large weights
+        val_frac:            float = 0.15,    # fraction of training days held out for validation
+        patience:            int   = 80,      # early-stop after this many iters with no val improvement
     ) -> None:
         self.seq_len            = seq_len
         self.n_iterations       = n_iterations
@@ -129,6 +132,8 @@ class PPOTrainer:
         self.print_every        = print_every
         self.reward_scale       = reward_scale
         self.device             = device or _auto_device()
+        self.val_frac           = val_frac
+        self.patience           = patience
 
         # Store kwargs so _collect_rollout can spin up per-episode envs
         self._env_kwargs = dict(
@@ -198,7 +203,7 @@ class PPOTrainer:
             self.model.module if isinstance(self.model, nn.DataParallel) else self.model
         )
 
-        self.optimiser = torch.optim.Adam(self.model.parameters(), lr=lr)
+        self.optimiser = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
 
     # ------------------------------------------------------------------
     # Public API
@@ -214,17 +219,33 @@ class PPOTrainer:
         episodes = self._make_episodes(bars, features)
         if not episodes:
             raise ValueError("No valid training episodes found (all days too short).")
+
+        # ── Train / validation split (random, by day) ─────────────────────
+        # Hold out val_frac of days to detect memorisation vs generalisation.
+        # Episodes are self-contained (one calendar day each) so random
+        # splitting does not introduce look-ahead bias.
+        rng = random.Random(42)
+        eps_shuffled = list(episodes)
+        rng.shuffle(eps_shuffled)
+        n_val          = max(1, int(len(eps_shuffled) * self.val_frac))
+        val_episodes   = eps_shuffled[:n_val]
+        train_episodes = eps_shuffled[n_val:]
+
         print(
-            f"  [PPO] {len(episodes)} training days  ·  "
+            f"  [PPO] {len(train_episodes)} train days  ·  {len(val_episodes)} val days  ·  "
             f"prediction horizon = {self.prediction_horizon} bars  ·  "
             f"{self.n_iterations} iterations  ·  "
             f"{self.rollout_days} days/rollout  ·  "
             f"{self.ppo_epochs} PPO epochs/iter\n"
         )
 
+        best_val_pnl   = -float("inf")
+        best_state     = None          # model weights at best val performance
+        iters_no_improve = 0
+
         last_metrics: dict = {}
         for iteration in range(1, self.n_iterations + 1):
-            rollout      = self._collect_rollout(episodes)
+            rollout      = self._collect_rollout(train_episodes)
             self._compute_gae(rollout)
             metrics      = self._ppo_update(rollout)
             last_metrics = metrics
@@ -236,15 +257,42 @@ class PPOTrainer:
             ) if len(rollout.get("pred_return_errors", [])) > 0 else 0.0
 
             if iteration % self.print_every == 0 or iteration == 1:
+                val_pnl = self._evaluate_val(val_episodes)
+                last_metrics["val_pnl"] = val_pnl
+
+                improved = val_pnl > best_val_pnl
+                if improved:
+                    best_val_pnl = val_pnl
+                    best_state   = {k: v.cpu().clone() for k, v in self._policy.state_dict().items()}
+                    iters_no_improve = 0
+                else:
+                    iters_no_improve += self.print_every
+
+                flag = " *" if improved else ""
                 print(
                     f"    iter {iteration:>4}  "
-                    f"mean_daily_pnl=${last_metrics['mean_episode_pnl']:+.0f}  "
+                    f"train_pnl=${last_metrics['mean_episode_pnl']:+.0f}  "
+                    f"val_pnl=${val_pnl:+.0f}{flag}  "
                     f"pred_err={last_metrics['mean_pred_error_pts']:.4f}  "
                     f"policy={metrics['policy_loss']:.4f}  "
                     f"value={metrics['value_loss']:.4f}  "
                     f"pred={metrics['pred_loss']:.4f}  "
                     f"clip={metrics['clip_frac']:.3f}"
                 )
+
+                if self.patience > 0 and iters_no_improve >= self.patience:
+                    print(
+                        f"  [early stop] val_pnl has not improved for {self.patience} iters  "
+                        f"·  best val_pnl=${best_val_pnl:+.0f}"
+                    )
+                    break
+
+        # Restore the checkpoint that performed best on the validation set
+        if best_state is not None:
+            self._policy.load_state_dict(
+                {k: v.to(self.device) for k, v in best_state.items()}
+            )
+            print(f"  [PPO] restored best model  (val_pnl=${best_val_pnl:+.0f})")
 
         return last_metrics
 
@@ -288,6 +336,36 @@ class PPOTrainer:
 
             episodes.append((f, p, fwd))
         return episodes
+
+    # ------------------------------------------------------------------
+    # Validation evaluation (greedy policy, no gradient)
+    # ------------------------------------------------------------------
+
+    def _evaluate_val(self, val_episodes: list) -> float:
+        """
+        Run the current policy greedily on val_episodes.
+        Returns mean daily PnL in dollars (same units as mean_episode_pnl).
+        """
+        self._policy.eval()
+        n_ep       = len(val_episodes)
+        env        = BatchedTradingEnv(n_envs=n_ep, **self._env_kwargs)
+        all_states = env.reset_all(val_episodes)
+        active_mask = np.ones(n_ep, dtype=bool)
+        ep_rets     = np.zeros(n_ep, dtype=np.float32)
+
+        with torch.no_grad():
+            while active_mask.any():
+                active  = np.where(active_mask)[0]
+                x       = torch.from_numpy(all_states[active]).to(self.device)
+                logits, _, _ = self._policy(x)
+                actions_np   = logits.argmax(dim=-1).cpu().numpy()
+                actions_all  = np.zeros(n_ep, dtype=np.int64)
+                actions_all[active] = actions_np
+                all_states, rews, dones = env.step_all(actions_all)
+                ep_rets     += rews * active_mask.astype(np.float32)
+                active_mask &= ~dones
+
+        return float(ep_rets.mean()) * self.reward_scale
 
     # ------------------------------------------------------------------
     # Rollout collection
