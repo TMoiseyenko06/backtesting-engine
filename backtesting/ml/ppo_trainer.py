@@ -78,7 +78,10 @@ class PPOTrainer:
     gamma              : float  Discount factor.
     gae_lambda         : float  GAE λ.
     value_loss_coef    : float
-    entropy_coef       : float  Entropy bonus — higher → more exploration / staying flat.
+    entropy_coef       : float  Entropy bonus — higher → more exploration, prevents FLAT collapse.
+    flat_penalty       : float  Dollar penalty per flat bar in the training env.  Incentivises
+                                the model to trade more frequently.  Scale: same as commission
+                                ($2 round-trip ≈ 0.5–2.0/bar for ~5 trades/day).
     pred_loss_coef     : float  Weight on auxiliary prediction MSE loss.
     prediction_horizon : int    H — bars ahead to predict (default 30 = 30 minutes).
     max_grad_norm      : float
@@ -104,7 +107,8 @@ class PPOTrainer:
         gamma:               float = 0.99,
         gae_lambda:          float = 0.95,
         value_loss_coef:     float = 0.25,   # reduced: return normalisation makes value loss O(1)
-        entropy_coef:        float = 0.005,  # higher → more exploration, prevents policy collapse
+        entropy_coef:        float = 0.01,   # higher → more exploration, prevents FLAT collapse
+        flat_penalty:        float = 0.0,    # dollar cost per flat bar (0 = off)
         pred_loss_coef:      float = 0.01,   # reduced: auxiliary task should not dominate policy
         prediction_horizon:  int   = 30,      # H-bar ahead prediction target
         max_grad_norm:       float = 0.5,
@@ -130,6 +134,7 @@ class PPOTrainer:
         self.gae_lambda         = gae_lambda
         self.value_loss_coef    = value_loss_coef
         self.entropy_coef       = entropy_coef
+        self.flat_penalty       = flat_penalty
         self.pred_loss_coef     = pred_loss_coef
         self.prediction_horizon = prediction_horizon
         self.max_grad_norm      = max_grad_norm
@@ -148,6 +153,7 @@ class PPOTrainer:
             contracts=contracts,
             max_loss=max_loss,
             reward_scale=reward_scale,
+            flat_penalty=flat_penalty,
         )
         self._env = TradingEnv(**self._env_kwargs)   # kept for external callers
 
@@ -270,6 +276,7 @@ class PPOTrainer:
             last_metrics["mean_episode_pnl"] = (
                 float(np.mean(rollout["episode_returns"])) * self.reward_scale
             )
+            last_metrics["trades_per_day"] = float(rollout["trades_per_day"])
             last_metrics["mean_pred_error_pts"] = float(
                 np.mean(np.abs(rollout["pred_return_errors"]))
             ) if len(rollout.get("pred_return_errors", [])) > 0 else 0.0
@@ -291,10 +298,10 @@ class PPOTrainer:
                     f"    iter {iteration:>4}  "
                     f"train_pnl=${last_metrics['mean_episode_pnl']:+.0f}  "
                     f"val_pnl=${val_pnl:+.0f}{flag}  "
-                    f"pred_err={last_metrics['mean_pred_error_pts']:.4f}  "
+                    f"trades/day={last_metrics['trades_per_day']:.1f}  "
                     f"policy={metrics['policy_loss']:.4f}  "
                     f"value={metrics['value_loss']:.4f}  "
-                    f"pred={metrics['pred_loss']:.4f}  "
+                    f"entropy={metrics['entropy']:.4f}  "
                     f"clip={metrics['clip_frac']:.3f}"
                 )
 
@@ -585,6 +592,9 @@ class PPOTrainer:
         # dwarf the direction term (~-1) and kill the direction gradient once they stabilise.
         combined_lp = lp_dir_np
 
+        total_entries = float(entered_np.sum())
+        trades_per_day = total_entries / max(n_ep, 1)
+
         return {
             "obs":                np.concatenate(obs_c, axis=0).astype(np.float32),
             "actions":            np.concatenate(act_c, axis=0).astype(np.int64),
@@ -598,6 +608,7 @@ class PPOTrainer:
             "entered_bracket":    entered_np,
             "episode_returns":    ep_rets.tolist(),
             "pred_return_errors": np.abs(pred_np - fwd_np),
+            "trades_per_day":     trades_per_day,
         }
 
     # ------------------------------------------------------------------

@@ -153,6 +153,7 @@ class BatchedTradingEnv:
         contracts:    float = 1.0,
         max_loss:     float = 2_500.0,
         reward_scale: float = 100.0,
+        flat_penalty: float = 0.0,
     ) -> None:
         self.n_envs       = n_envs
         self.seq_len      = seq_len
@@ -161,7 +162,9 @@ class BatchedTradingEnv:
         self.multiplier   = multiplier
         self.commission   = commission
         self.contracts    = contracts
+        self.max_loss     = max_loss
         self.reward_scale = reward_scale
+        self.flat_penalty = flat_penalty
 
         # Allocated in reset_all — episode data (padded 2D arrays)
         self._features  : np.ndarray | None = None  # (n, max_bars, n_features)
@@ -279,7 +282,9 @@ class BatchedTradingEnv:
         mtm     = ((effective_price - self._prev_closes)
                    * self._positions.astype(np.float32)
                    * self.contracts * self.multiplier)
-        rewards = (mtm - exit_commission) / self.reward_scale
+        # Flat penalty: small cost per bar for doing nothing, scaled by reward_scale
+        flat_cost = (self._positions == 0).astype(np.float32) * self.flat_penalty
+        rewards = (mtm - exit_commission - flat_cost) / self.reward_scale
 
         # ── 3. Update bracket state after exits ────────────────────────
         post_exit_pos   = np.where(bracket_exit, np.int32(0),     self._positions)

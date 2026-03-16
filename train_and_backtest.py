@@ -48,6 +48,9 @@ Options (RL-specific)
     --rl-days       Episodes (trading days) per PPO rollout (default: 16)
     --rl-ppo-epochs PPO update epochs per iteration (default: 4)
     --rl-lr         PPO Adam learning rate (default: 3e-4)
+    --entropy-coef  Entropy bonus (default: 0.01) — prevents FLAT collapse
+    --flat-penalty  Dollar cost per flat bar (default: 0.0) — incentivises trading frequency
+                    Start with 0.5–1.0 for ~5 trades/day; same scale as commission ($2/side)
 
 Options (supervised-specific)
 ------------------------------
@@ -228,6 +231,7 @@ def _print_train_section(fold_results: list, model_path: str | None, elapsed: fl
 def _print_rl_train_section(metrics: dict, model_path: str | None, elapsed: float) -> None:
     print(_section("TRAIN  (PPO-RL)"))
     print(_kv("Mean daily P&L :", f"${metrics.get('mean_episode_pnl', 0):+,.0f}"))
+    print(_kv("Trades / day   :", f"{metrics.get('trades_per_day', 0):.1f}"))
     print(_kv("Policy loss    :", f"{metrics.get('policy_loss', 0):.4f}"))
     print(_kv("Value  loss    :", f"{metrics.get('value_loss',  0):.4f}"))
     print(_kv("Entropy        :", f"{metrics.get('entropy',     0):.4f}"))
@@ -314,6 +318,11 @@ def _parse_args() -> argparse.Namespace:
                    help="PPO update epochs per iteration (default 4)")
     p.add_argument("--rl-lr",              type=float, default=3e-4, dest="rl_lr",
                    help="PPO Adam learning rate (default 3e-4)")
+    p.add_argument("--entropy-coef",       type=float, default=0.01, dest="entropy_coef",
+                   help="PPO entropy bonus coefficient — higher prevents FLAT collapse (default 0.01)")
+    p.add_argument("--flat-penalty",       type=float, default=0.0,  dest="flat_penalty",
+                   help="Dollar penalty per flat bar during training — incentivises more trading "
+                        "(0=off; try 0.5–2.0 for ~5 trades/day; same scale as commission)")
     p.add_argument("--prediction-horizon", type=int,   default=30,   dest="prediction_horizon",
                    help="Bars ahead for the model to predict (default 30 = 30 min)")
     p.add_argument("--weight-decay",       type=float, default=1e-4, dest="weight_decay",
@@ -432,6 +441,8 @@ def main() -> None:
                 commission=2.0,
                 contracts=args.contracts,
                 max_loss=args.max_loss,
+                entropy_coef=args.entropy_coef,
+                flat_penalty=args.flat_penalty,
                 weight_decay=args.weight_decay,
                 val_frac=args.val_frac,
                 patience=args.patience,
