@@ -272,6 +272,179 @@ def _print_backtest_section(analytics, symbol: str, test_bars: int,
 
 
 # ---------------------------------------------------------------------------
+# NN-based backtest helpers (replaces BacktestEngine for RL mode)
+# ---------------------------------------------------------------------------
+
+def _build_test_episodes(
+    bars, features: np.ndarray, seq_len: int, prediction_horizon: int
+) -> list:
+    """
+    Group test bars by UTC calendar date into episode tuples.
+    Mirrors PPOTrainer._make_episodes() so the test env is identical to training.
+
+    Returns list of (features, closes, highs, lows, fwd_returns) tuples.
+    """
+    from collections import defaultdict
+    day_map: dict = defaultdict(list)
+    for i, bar in enumerate(bars):
+        day_map[bar.timestamp.date()].append(i)
+
+    H = prediction_horizon
+    episodes = []
+    for date in sorted(day_map.keys()):
+        idx = day_map[date]
+        if len(idx) <= seq_len:
+            continue
+        f = features[idx].astype(np.float32)
+        p = np.array([bars[i].close for i in idx], dtype=np.float32)
+        h = np.array([bars[i].high  for i in idx], dtype=np.float32)
+        l = np.array([bars[i].low   for i in idx], dtype=np.float32)
+        n = len(p)
+        fwd = np.zeros(n, dtype=np.float32)
+        for i in range(n - H):
+            if p[i] > 0:
+                fwd[i] = (p[i + H] - p[i]) / p[i]
+        episodes.append((f, p, h, l, fwd))
+    return episodes
+
+
+def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
+                 device: str, initial_cash: float):
+    """
+    Run the trained model greedily on every test episode using BatchedTradingEnv.
+    Identical evaluation logic to PPOTrainer._evaluate_val(), run day-by-day so
+    we can track individual trade P&L for analytics.
+
+    Returns an analytics object with the same attributes used by
+    _print_backtest_section() and _notify_telegram().
+    """
+    import torch
+    from backtesting.ml.rl_env import BatchedTradingEnv
+
+    model.eval()
+    reward_scale = env_kwargs["reward_scale"]
+
+    # During the test we measure real P&L — no flat_penalty training artifact.
+    bt_kwargs = {**env_kwargs, "flat_penalty": 0.0}
+
+    daily_pnls: list[float] = []
+    trade_pnls: list[float] = []
+    n_trades = 0
+
+    for episode in test_episodes:
+        env    = BatchedTradingEnv(n_envs=1, **bt_kwargs)
+        states = env.reset_all([episode])
+
+        day_pnl       = 0.0
+        in_trade      = False
+        trade_pnl_acc = 0.0
+
+        with torch.no_grad():
+            while True:
+                x       = torch.from_numpy(states).to(device)
+                logits, _, _, sl_mean, tp_mean = model(x)
+
+                actions = logits.argmax(dim=-1).cpu().numpy()   # (1,)
+                sl_arr  = sl_mean.cpu().numpy().flatten()        # (1,)
+                tp_arr  = tp_mean.cpu().numpy().flatten()        # (1,)
+
+                directions = np.where(
+                    actions == 1, np.int32(1),
+                    np.where(actions == 2, np.int32(-1), np.int32(0))
+                )
+
+                states, rews, dones, entered = env.step_all(
+                    directions.astype(np.int32), sl_arr, tp_arr
+                )
+
+                rew_dollars = float(rews[0]) * reward_scale
+                day_pnl    += rew_dollars
+
+                # ── Track individual trade P&L ──────────────────────────
+                if entered[0]:
+                    n_trades += 1
+                    if in_trade:
+                        # Previous bracket closed AND new entry in same bar
+                        trade_pnls.append(trade_pnl_acc)
+                    in_trade      = True
+                    trade_pnl_acc = rew_dollars          # includes -entry_commission
+                elif in_trade:
+                    trade_pnl_acc += rew_dollars
+                    if env._positions[0] == 0:           # SL/TP hit → bracket closed
+                        trade_pnls.append(trade_pnl_acc)
+                        in_trade      = False
+                        trade_pnl_acc = 0.0
+
+                if dones[0]:
+                    if in_trade:                         # EOD forced flat
+                        trade_pnls.append(trade_pnl_acc)
+                        in_trade = False
+                    break
+
+        daily_pnls.append(day_pnl)
+
+    # ── Analytics ─────────────────────────────────────────────────────────
+    daily_arr  = np.array(daily_pnls, dtype=np.float64)
+    cum_equity = initial_cash + np.cumsum(daily_arr)
+
+    total_return = float(daily_arr.sum())
+
+    sharpe = 0.0
+    if len(daily_arr) > 1 and daily_arr.std() > 0:
+        sharpe = float(daily_arr.mean() / daily_arr.std() * np.sqrt(252))
+
+    sortino  = 0.0
+    neg_days = daily_arr[daily_arr < 0]
+    if len(neg_days) > 1 and neg_days.std() > 0:
+        sortino = float(daily_arr.mean() / neg_days.std() * np.sqrt(252))
+
+    peak   = np.maximum.accumulate(cum_equity)
+    max_dd = float((peak - cum_equity).max()) if len(cum_equity) > 0 else 0.0
+    max_dd_pct = max_dd / initial_cash * 100 if initial_cash > 0 else 0.0
+    calmar     = total_return / max_dd if max_dd > 0 else 0.0
+
+    win_rate = avg_win = avg_loss = 0.0
+    largest_win = largest_loss = profit_factor = expectancy = 0.0
+    if trade_pnls:
+        tp_arr_np    = np.array(trade_pnls, dtype=np.float64)
+        wins         = tp_arr_np[tp_arr_np > 0]
+        losses       = tp_arr_np[tp_arr_np <= 0]
+        win_rate     = 100.0 * len(wins) / len(tp_arr_np)
+        avg_win      = float(wins.mean())   if len(wins)   > 0 else 0.0
+        avg_loss     = float(losses.mean()) if len(losses) > 0 else 0.0
+        largest_win  = float(wins.max())    if len(wins)   > 0 else 0.0
+        largest_loss = float(losses.min())  if len(losses) > 0 else 0.0
+        gross_profit = float(wins.sum())             if len(wins)   > 0 else 0.0
+        gross_loss   = abs(float(losses.sum()))      if len(losses) > 0 else 0.0
+        profit_factor = gross_profit / gross_loss    if gross_loss  > 0 else float("inf")
+        expectancy   = float(tp_arr_np.mean())
+
+    total_commission = n_trades * env_kwargs["commission"] * env_kwargs["contracts"] * 2
+
+    class _A:
+        pass
+    a = _A()
+    a.total_return     = total_return
+    a.total_return_pct = total_return / initial_cash * 100
+    a.final_equity     = initial_cash + total_return
+    a.max_drawdown     = max_dd
+    a.max_drawdown_pct = max_dd_pct
+    a.sharpe_ratio     = sharpe
+    a.sortino_ratio    = sortino
+    a.calmar_ratio     = calmar
+    a.total_trades     = n_trades
+    a.win_rate         = win_rate
+    a.avg_win          = avg_win
+    a.avg_loss         = avg_loss
+    a.profit_factor    = profit_factor
+    a.expectancy       = expectancy
+    a.largest_win      = largest_win
+    a.largest_loss     = largest_loss
+    a.total_commission = total_commission
+    return a
+
+
+# ---------------------------------------------------------------------------
 # CLI
 # ---------------------------------------------------------------------------
 
@@ -352,11 +525,8 @@ def main() -> None:
     args = _parse_args()
 
     # ── 0. imports (deferred so --help is fast) ───────────────────────────
-    from backtesting.data_feed import DataFeed
-    from backtesting.engine import BacktestEngine
     from backtesting.loaders.databento import from_databento_file
     from backtesting.ml.features import make_features
-    from backtesting.portfolio import Portfolio, MarginSpec
 
     # ── 1. GPU detection ──────────────────────────────────────────────────
     device_info = _detect_device()
@@ -414,7 +584,6 @@ def main() -> None:
         # ── PPO reinforcement learning ────────────────────────────────
         from backtesting.ml.actor_critic import ActorCriticLSTM
         from backtesting.ml.ppo_trainer import PPOTrainer
-        from strategies.rl_trading import RLTradingStrategy
 
         if args.backtest_only:
             # Skip training — load weights from --resume or default save path
@@ -466,25 +635,34 @@ def main() -> None:
         print(f"  Model fingerprint (weight sum): {_wsum:.6f}")
         print(f"  (This should differ across training runs — if identical, weights are not updating)\n")
 
-        # ── 6a. Backtest (RL) ─────────────────────────────────────────
-        warmup   = args.seq_len + 60
-        feed_test = DataFeed(test_bars, warmup_bars=warmup)
-        strategy = RLTradingStrategy(
-            model=trained_model,
-            device=device,
-            symbol=args.symbol,
+        # ── 6a. NN backtest (direct evaluation — same logic as val) ───
+        print("  Building test-set features …", flush=True)
+        test_features = make_features(test_bars)
+
+        env_kwargs = dict(
             seq_len=args.seq_len,
-            contracts=args.contracts,
-            eod_hour_utc=args.eod_hour,
-            no_entry_hour_utc=args.no_entry_hour,
-            max_loss=args.max_loss,
+            n_features=22,
             multiplier=args.multiplier,
+            commission=2.0,
+            contracts=args.contracts,
+            max_loss=args.max_loss,
+            reward_scale=100.0,
+            flat_penalty=args.flat_penalty,
         )
+        test_episodes = _build_test_episodes(
+            test_bars, test_features, args.seq_len, args.prediction_horizon
+        )
+        print(f"  {len(test_episodes)} test-set trading days", flush=True)
+        print("  Running NN backtest on test set …", flush=True)
+        analytics = _nn_backtest(trained_model, test_episodes, env_kwargs, device, args.cash)
 
     else:
         # ── Supervised walk-forward training ─────────────────────────
+        from backtesting.data_feed import DataFeed
+        from backtesting.engine import BacktestEngine
         from backtesting.ml.dataset import walk_forward_splits
         from backtesting.ml.trainer import Trainer
+        from backtesting.portfolio import Portfolio, MarginSpec
         from strategies.lstm_signal import LSTMSignalStrategy
 
         print(f"  Training LSTM — {args.folds} walk-forward folds …\n", flush=True)
@@ -519,9 +697,9 @@ def main() -> None:
         )
 
         # ── 6b. Backtest (supervised) ─────────────────────────────────
-        warmup   = args.seq_len + 60
+        warmup    = args.seq_len + 60
         feed_test = DataFeed(test_bars, warmup_bars=warmup)
-        strategy = LSTMSignalStrategy(
+        strategy  = LSTMSignalStrategy(
             model=trained_model,
             device=device,
             symbol=args.symbol,
@@ -533,37 +711,36 @@ def main() -> None:
             no_entry_hour_utc=args.no_entry_hour,
             min_hold_bars=args.min_hold_bars,
         )
-
-    portfolio = Portfolio(
-        initial_cash=args.cash,
-        margin_specs={
-            args.symbol: MarginSpec(
-                args.symbol,
-                args.init_margin,
-                args.maint_margin,
-                args.multiplier,
-            )
-        },
-        commission_per_contract=2.0,
-        slippage_ticks=1,
-        tick_size=0.25,
-    )
-
-    print("  Running backtest on test set …", flush=True)
-    result = BacktestEngine(feed_test, portfolio, [strategy], verbose=False).run()
+        portfolio = Portfolio(
+            initial_cash=args.cash,
+            margin_specs={
+                args.symbol: MarginSpec(
+                    args.symbol,
+                    args.init_margin,
+                    args.maint_margin,
+                    args.multiplier,
+                )
+            },
+            commission_per_contract=2.0,
+            slippage_ticks=1,
+            tick_size=0.25,
+        )
+        print("  Running backtest on test set …", flush=True)
+        result   = BacktestEngine(feed_test, portfolio, [strategy], verbose=False).run()
+        analytics = result.analytics
 
     # ── 7. Dashboard ──────────────────────────────────────────────────────
     print()
     b_start = test_bars[0].timestamp.strftime("%Y-%m-%d")
     b_end   = test_bars[-1].timestamp.strftime("%Y-%m-%d")
-    _print_backtest_section(result.analytics, args.symbol, len(test_bars), b_start, b_end)
+    _print_backtest_section(analytics, args.symbol, len(test_bars), b_start, b_end)
     print()
 
     # ── 8. Telegram notification ───────────────────────────────────────────
     if args.tg_token and args.tg_chat:
         total_elapsed = time.time() - t0
         mode_label = "PPO-RL" if args.rl else "Supervised"
-        _notify_telegram(args.tg_token, args.tg_chat, result.analytics, total_elapsed, mode_label)
+        _notify_telegram(args.tg_token, args.tg_chat, analytics, total_elapsed, mode_label)
         print(f"  Notification sent to Telegram chat {args.tg_chat}")
 
 
