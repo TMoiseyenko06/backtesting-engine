@@ -104,8 +104,8 @@ class PPOTrainer:
         gamma:               float = 0.99,
         gae_lambda:          float = 0.95,
         value_loss_coef:     float = 0.25,   # reduced: return normalisation makes value loss O(1)
-        entropy_coef:        float = 0.05,   # higher → more exploration, prevents policy collapse
-        pred_loss_coef:      float = 0.1,    # reduced: auxiliary task should not dominate policy
+        entropy_coef:        float = 0.005,  # higher → more exploration, prevents policy collapse
+        pred_loss_coef:      float = 0.01,   # reduced: auxiliary task should not dominate policy
         prediction_horizon:  int   = 30,      # H-bar ahead prediction target
         max_grad_norm:       float = 0.5,
         print_every:         int   = 10,
@@ -118,6 +118,7 @@ class PPOTrainer:
         weight_decay:        float = 1e-4,    # L2 regularisation — penalises large weights
         val_frac:            float = 0.15,    # fraction of training days held out for validation
         patience:            int   = 80,      # early-stop after this many iters with no val improvement
+        pretrained_path:     Optional[str] = None,  # .pt checkpoint to resume from
     ) -> None:
         self.seq_len            = seq_len
         self.n_iterations       = n_iterations
@@ -219,6 +220,11 @@ class PPOTrainer:
         )
 
         self.optimiser = torch.optim.Adam(self.model.parameters(), lr=lr, weight_decay=weight_decay)
+
+        if pretrained_path is not None:
+            sd = torch.load(pretrained_path, map_location=device)
+            self._policy.load_state_dict(sd, strict=True)
+            print(f"  Resumed weights from {pretrained_path}")
 
     # ------------------------------------------------------------------
     # Public API
@@ -575,8 +581,9 @@ class PPOTrainer:
         lp_sl_np    = np.concatenate(lps_c, axis=0)
         lp_tp_np    = np.concatenate(lpt_c, axis=0)
 
-        # Combined log_prob: direction + entered*(sl+tp)
-        combined_lp = lp_dir_np + entered_np.astype(np.float32) * (lp_sl_np + lp_tp_np)
+        # Combined log_prob: direction only — SL/TP log_probs (~-10 to -12 magnitude)
+        # dwarf the direction term (~-1) and kill the direction gradient once they stabilise.
+        combined_lp = lp_dir_np
 
         return {
             "obs":                np.concatenate(obs_c, axis=0).astype(np.float32),
@@ -690,8 +697,8 @@ class PPOTrainer:
                 new_lp_sl = Normal(sl_mean, sl_std).log_prob(batch_sl)
                 new_lp_tp = Normal(tp_mean, tp_std).log_prob(batch_tp)
 
-                # Combined log_prob: sl/tp only count on bracket-entry steps
-                new_lp = new_lp_dir + batch_entered.float() * (new_lp_sl + new_lp_tp)
+                # Direction-only ratio: SL/TP heads learn via shared backbone gradients
+                new_lp = new_lp_dir
 
                 ratio     = torch.exp(new_lp - batch_old_lp)
                 clip_frac = float(((ratio - 1.0).abs() > self.clip_eps).float().mean().item())
@@ -709,14 +716,16 @@ class PPOTrainer:
                     (v_clipped - batch_norm_ret).pow(2),
                 ).mean()
 
-                l_pred = torch.nn.functional.mse_loss(pred_returns, batch_fwd)
-
                 loss = (
                     l_clip
                     + self.value_loss_coef * l_val
                     - self.entropy_coef    * entropy
-                    + self.pred_loss_coef  * l_pred
                 )
+
+            # Pred loss computed in float32 outside amp_ctx to prevent bfloat16 overflow
+            batch_fwd_safe = batch_fwd.clamp(-0.05, 0.05).float()
+            l_pred = torch.nn.functional.mse_loss(pred_returns.float(), batch_fwd_safe)
+            loss = loss + self.pred_loss_coef * l_pred
 
             self._scaler.scale(loss).backward()
             self._scaler.unscale_(self.optimiser)

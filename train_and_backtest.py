@@ -306,6 +306,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Fraction of training days held out for validation (default 0.15)")
     p.add_argument("--patience",           type=int,   default=80,   dest="patience",
                    help="Early-stop after this many iters with no val improvement (default 80, 0=off)")
+    p.add_argument("--resume",             type=str,   default=None, dest="resume", metavar="PATH",
+                   help="Path to .pt checkpoint to resume PPO training from (e.g. models/nq_lstm_ohlcv1m.pt)")
     p.add_argument("--tg-token",   default="", dest="tg_token",
                    help="Telegram bot token (from @BotFather)")
     p.add_argument("--tg-chat",    default="", dest="tg_chat",
@@ -403,6 +405,7 @@ def main() -> None:
             weight_decay=args.weight_decay,
             val_frac=args.val_frac,
             patience=args.patience,
+            pretrained_path=args.resume,
         )
         rl_metrics = ppo_trainer.fit(train_bars, features)
         elapsed = time.time() - t0
