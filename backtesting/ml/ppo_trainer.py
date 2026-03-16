@@ -247,13 +247,11 @@ class PPOTrainer:
         if not episodes:
             raise ValueError("No valid training episodes found (all days too short).")
 
-        # ── Train / validation split (random, by day) ─────────────────────
-        rng = random.Random(42)
-        eps_shuffled = list(episodes)
-        rng.shuffle(eps_shuffled)
-        n_val          = max(1, int(len(eps_shuffled) * self.val_frac))
-        val_episodes   = eps_shuffled[:n_val]
-        train_episodes = eps_shuffled[n_val:]
+        # ── Train / validation split (chronological — last val_frac days) ────
+        # Chronological split avoids using future data to validate past models.
+        n_val          = max(1, int(len(episodes) * self.val_frac))
+        train_episodes = episodes[:-n_val]
+        val_episodes   = episodes[-n_val:]
 
         print(
             f"  [PPO] {len(train_episodes)} train days  ·  {len(val_episodes)} val days  ·  "
