@@ -116,17 +116,20 @@ class RLTradingStrategy(Strategy):
 
         # ── 2. Hard stop: absolute + trailing drawdown ───────────────
         if pos != 0:
-            # Fallback: if on_fill didn't capture the entry price (e.g. fill_price
-            # was None), use bar.open as the conservative entry estimate so the
-            # stop is never silently bypassed.
-            if self._entry_price == 0.0:
-                self._entry_price = bar.open
+            # Use the portfolio's authoritative avg_entry_price rather than
+            # self._entry_price.  on_fill ordering during flips (two fills in one
+            # bar) can transiently leave self._entry_price=0, causing the fallback
+            # to compute unrealised as (close-open)*multiplier — a few dollars per
+            # 1-min bar — which never reaches max_loss and silently disables the stop.
+            entry_price = self.position_obj(self._symbol).avg_entry_price
+            if entry_price == 0.0:
+                entry_price = bar.open   # genuine last resort
                 self._peak_unrealised = 0.0
 
             direction  = 1.0 if pos > 0 else -1.0
             unrealised = (
                 direction
-                * (bar.close - self._entry_price)
+                * (bar.close - entry_price)
                 * abs(pos)
                 * bar.contract_multiplier
             )
@@ -136,6 +139,7 @@ class RLTradingStrategy(Strategy):
             # Condition 1 — absolute hard stop: loss from entry >= $max_loss
             # Condition 2 — trailing stop: drawdown from peak >= $max_loss
             if unrealised <= -self._max_loss or self._peak_unrealised - unrealised >= self._max_loss:
+                self.cancel_all(self._symbol)   # drop any pending flip orders
                 self.close_position(self._symbol, tag="hard_stop")
                 return
 
