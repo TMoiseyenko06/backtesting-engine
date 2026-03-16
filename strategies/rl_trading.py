@@ -182,7 +182,17 @@ class RLTradingStrategy(Strategy):
             return
 
         # ── 2. In bracket — model is ignored, orders manage the trade ─
+        #    Per-bar hard stop: if bracket SL somehow fails to execute,
+        #    this guarantees we never lose more than max_loss dollars.
         if self._in_bracket:
+            if abs(pos) > 1e-9 and pos_obj.avg_entry_price > 0.0:
+                upnl = (bar.close - pos_obj.avg_entry_price) * pos * self._multiplier
+                if upnl < -self._max_loss:
+                    self.cancel_all(self._symbol)
+                    self.close_position(self._symbol, tag="hard_stop")
+                    self._in_bracket  = False
+                    self._sl_order_id = None
+                    self._tp_order_id = None
             return
 
         # ── 3. No new entries near EOD ────────────────────────────────
@@ -213,7 +223,8 @@ class RLTradingStrategy(Strategy):
             return  # flat signal, stay flat
 
         # ── 6. Submit market entry (bracket placed in on_fill) ────────
-        self._pending_sl_pts = sl_pts
+        _max_sl = self._max_loss / (self._contracts * self._multiplier)
+        self._pending_sl_pts = min(sl_pts, _max_sl)
         self._pending_tp_pts = tp_pts
 
         if desired_pos == 1:

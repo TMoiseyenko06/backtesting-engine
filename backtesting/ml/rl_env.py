@@ -65,7 +65,8 @@ class TradingEnv:
     multiplier    : float  Contract point value, e.g. $20 for NQ.
     commission    : float  $ per contract per side.
     contracts     : float  Position size.
-    max_loss      : float  Unused (bracket orders replace the manual stop).
+    max_loss      : float  Hard cap on SL distance: sl_pts is clamped so that
+                           max dollar loss per trade ≤ max_loss.
     reward_scale  : float  Divide all rewards by this factor (keeps rewards ~O(1)).
     """
 
@@ -150,7 +151,7 @@ class BatchedTradingEnv:
         multiplier:   float = 20.0,
         commission:   float = 2.0,
         contracts:    float = 1.0,
-        max_loss:     float = 2_500.0,   # retained for API compat, not used
+        max_loss:     float = 2_500.0,
         reward_scale: float = 100.0,
     ) -> None:
         self.n_envs       = n_envs
@@ -292,6 +293,9 @@ class BatchedTradingEnv:
         entry_price = curr_closes   # enter at current bar's close
 
         dir_f       = directions.astype(np.float32)
+        # Hard-cap sl_pts: max loss per trade must not exceed max_loss dollars
+        _max_sl_pts = self.max_loss / (self.contracts * self.multiplier)
+        sl_pts      = np.minimum(sl_pts, _max_sl_pts)
         sl_price_new = entry_price - dir_f * sl_pts
         tp_price_new = entry_price + dir_f * tp_pts
 
