@@ -94,6 +94,7 @@ class ActorCriticLSTM(nn.Module):
         self.prediction_head = nn.Sequential(
             nn.Dropout(dropout),
             nn.Linear(hidden_size, 1),
+            nn.Tanh(),
         )
 
     # ------------------------------------------------------------------
