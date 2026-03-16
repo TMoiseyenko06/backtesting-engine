@@ -324,6 +324,8 @@ def _parse_args() -> argparse.Namespace:
                    help="Early-stop after this many iters with no val improvement (default 80, 0=off)")
     p.add_argument("--resume",             type=str,   default=None, dest="resume", metavar="PATH",
                    help="Path to .pt checkpoint to resume PPO training from (e.g. models/nq_lstm_ohlcv1m.pt)")
+    p.add_argument("--backtest-only",      action="store_true",      dest="backtest_only",
+                   help="Skip training; load model from --resume (or --save-model path) and run backtest only")
     p.add_argument("--tg-token",   default=os.environ.get("TELEGRAM_BOT_TOKEN", ""), dest="tg_token",
                    help="Telegram bot token — overrides TELEGRAM_BOT_TOKEN in .env")
     p.add_argument("--tg-chat",    default=os.environ.get("TELEGRAM_CHAT_ID", ""),   dest="tg_chat",
@@ -401,38 +403,50 @@ def main() -> None:
 
     if args.rl:
         # ── PPO reinforcement learning ────────────────────────────────
+        from backtesting.ml.actor_critic import ActorCriticLSTM
         from backtesting.ml.ppo_trainer import PPOTrainer
         from strategies.rl_trading import RLTradingStrategy
 
-        print(f"  Training with PPO (RL) — {args.rl_iters} iterations …\n", flush=True)
-        ppo_trainer = PPOTrainer(
-            hidden_size=args.hidden,
-            seq_len=args.seq_len,
-            lr=args.rl_lr,
-            n_iterations=args.rl_iters,
-            rollout_days=args.rl_days,
-            ppo_epochs=args.rl_ppo_epochs,
-            prediction_horizon=args.prediction_horizon,
-            device=device,
-            multiplier=args.multiplier,
-            commission=2.0,
-            contracts=args.contracts,
-            max_loss=args.max_loss,
-            weight_decay=args.weight_decay,
-            val_frac=args.val_frac,
-            patience=args.patience,
-            pretrained_path=args.resume,
-        )
-        rl_metrics = ppo_trainer.fit(train_bars, features)
-        elapsed = time.time() - t0
+        if args.backtest_only:
+            # Skip training — load weights from --resume or default save path
+            load_path = args.resume or args.save_model
+            if not Path(load_path).exists():
+                print(f"ERROR: --backtest-only requires a saved model at '{load_path}'.\n"
+                      f"       Train first, or pass --resume <path>.", file=sys.stderr)
+                sys.exit(1)
+            print(f"  Skipping training — loading model from {load_path}\n", flush=True)
+            trained_model = ActorCriticLSTM.load(load_path, device=device)
+            elapsed = 0.0
+        else:
+            print(f"  Training with PPO (RL) — {args.rl_iters} iterations …\n", flush=True)
+            ppo_trainer = PPOTrainer(
+                hidden_size=args.hidden,
+                seq_len=args.seq_len,
+                lr=args.rl_lr,
+                n_iterations=args.rl_iters,
+                rollout_days=args.rl_days,
+                ppo_epochs=args.rl_ppo_epochs,
+                prediction_horizon=args.prediction_horizon,
+                device=device,
+                multiplier=args.multiplier,
+                commission=2.0,
+                contracts=args.contracts,
+                max_loss=args.max_loss,
+                weight_decay=args.weight_decay,
+                val_frac=args.val_frac,
+                patience=args.patience,
+                pretrained_path=args.resume,
+            )
+            rl_metrics = ppo_trainer.fit(train_bars, features)
+            elapsed = time.time() - t0
 
-        if model_path:
-            ppo_trainer.save(model_path)
+            if model_path:
+                ppo_trainer.save(model_path)
 
-        print()
-        _print_rl_train_section(rl_metrics, model_path, elapsed)
+            print()
+            _print_rl_train_section(rl_metrics, model_path, elapsed)
 
-        trained_model = ppo_trainer._policy   # bare ActorCriticLSTM
+            trained_model = ppo_trainer._policy   # bare ActorCriticLSTM
 
         # ── 6a. Backtest (RL) ─────────────────────────────────────────
         warmup   = args.seq_len + 60
