@@ -100,9 +100,9 @@ class PPOTrainer:
         clip_eps:            float = 0.2,
         gamma:               float = 0.99,
         gae_lambda:          float = 0.95,
-        value_loss_coef:     float = 0.5,
-        entropy_coef:        float = 0.05,    # higher → more exploration, prevents policy collapse
-        pred_loss_coef:      float = 0.3,     # lower → less memorisation of specific returns
+        value_loss_coef:     float = 0.25,   # reduced: return normalisation makes value loss O(1)
+        entropy_coef:        float = 0.05,   # higher → more exploration, prevents policy collapse
+        pred_loss_coef:      float = 0.1,    # reduced: auxiliary task should not dominate policy
         prediction_horizon:  int   = 30,      # H-bar ahead prediction target
         max_grad_norm:       float = 0.5,
         print_every:         int   = 10,
@@ -545,19 +545,52 @@ class PPOTrainer:
         """
         Full PPO loss including auxiliary prediction MSE:
           L = -L_clip + c_v * L_value - c_e * L_entropy + c_p * L_pred
+
+        Returns normalisation
+        ---------------------
+        Raw GAE returns share the same scale as the (possibly diverging) value
+        function, creating a positive-feedback loop that drives value loss into
+        the tens of thousands.  We break this by normalising the return targets
+        to zero mean / unit std before any gradient flows through the value head.
+        The policy gradient is unaffected (advantages are normalised separately).
+
+        Value clipping
+        --------------
+        Standard PPO value clipping prevents large one-step updates that would
+        push the value function far from its previous estimate, complementing
+        the return normalisation to keep value loss in the O(0.5–2.0) range.
         """
         self.model.train()
 
-        obs         = torch.tensor(rollout["obs"],           device=self.device)
-        actions     = torch.tensor(rollout["actions"],       device=self.device)
-        old_lp      = torch.tensor(rollout["log_probs"],     device=self.device)
-        returns     = torch.tensor(rollout["returns"],       device=self.device)
-        advantages  = torch.tensor(rollout["advantages"],    device=self.device)
-        actual_fwd  = torch.tensor(rollout["actual_fwd_rets"], device=self.device)
+        # ── Normalise returns BEFORE building tensors ─────────────────────
+        # This is the primary fix for value loss divergence.  raw returns
+        # share the value function's scale (can be 10k+); after normalisation
+        # every mini-batch target has mean≈0 std≈1, so value loss starts at
+        # O(1) and converges quickly instead of spiralling to 48 000+.
+        rets_np       = rollout["returns"].astype(np.float32)
+        ret_mean      = float(rets_np.mean())
+        ret_std       = float(rets_np.std()) + 1e-8
+        norm_rets_np  = (rets_np - ret_mean) / ret_std
+
+        # Old value estimates normalised with the SAME stats so value-clipping
+        # comparison is in the same normalised space.
+        old_vals_norm_np = (
+            rollout["values"].astype(np.float32) - ret_mean
+        ) / ret_std
+
+        obs           = torch.tensor(rollout["obs"],              device=self.device)
+        actions       = torch.tensor(rollout["actions"],          device=self.device)
+        old_lp        = torch.tensor(rollout["log_probs"],        device=self.device)
+        norm_returns  = torch.tensor(norm_rets_np,                device=self.device)
+        old_vals_norm = torch.tensor(old_vals_norm_np,            device=self.device)
+        advantages    = torch.tensor(rollout["advantages"],       device=self.device)
+        actual_fwd    = torch.tensor(rollout["actual_fwd_rets"],  device=self.device)
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
-        dataset = TensorDataset(obs, actions, old_lp, returns, advantages, actual_fwd)
+        dataset = TensorDataset(
+            obs, actions, old_lp, norm_returns, old_vals_norm, advantages, actual_fwd
+        )
         loader  = DataLoader(dataset, batch_size=self.minibatch_size, shuffle=True)
 
         amp_ctx = torch.amp.autocast(
@@ -569,7 +602,7 @@ class PPOTrainer:
         tot_policy = tot_value = tot_entropy = tot_pred = tot_clip = 0.0
         n_batches  = 0
 
-        for batch_obs, batch_act, batch_old_lp, batch_ret, batch_adv, batch_fwd in loader:
+        for batch_obs, batch_act, batch_old_lp, batch_norm_ret, batch_old_val_norm, batch_adv, batch_fwd in loader:
             self.optimiser.zero_grad()
 
             with amp_ctx:
@@ -588,7 +621,18 @@ class PPOTrainer:
                 surr1  = ratio * batch_adv
                 surr2  = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * batch_adv
                 l_clip = -torch.min(surr1, surr2).mean()
-                l_val  = 0.5 * (values - batch_ret).pow(2).mean()
+
+                # Value loss with clipping (PPO standard).
+                # Both values and targets are in normalised space (mean=0 std=1)
+                # so value loss should remain O(0.5–2.0) throughout training.
+                v_clipped = batch_old_val_norm + torch.clamp(
+                    values - batch_old_val_norm, -self.clip_eps, self.clip_eps
+                )
+                l_val = 0.5 * torch.max(
+                    (values    - batch_norm_ret).pow(2),
+                    (v_clipped - batch_norm_ret).pow(2),
+                ).mean()
+
                 l_pred = torch.nn.functional.mse_loss(pred_returns, batch_fwd)
 
                 loss = (

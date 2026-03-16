@@ -88,9 +88,11 @@ class RLTradingStrategy(Strategy):
         if abs(pos_after) > 1e-9 and order.fill_price is not None:
             self._entry_price = order.fill_price
             self._peak_unrealised = 0.0
-        else:
+        elif abs(pos_after) < 1e-9:
+            # Position fully closed
             self._entry_price = 0.0
             self._peak_unrealised = 0.0
+        # If fill_price is None but we have a position, keep existing entry price
 
     # ------------------------------------------------------------------
     # Main bar callback
@@ -112,8 +114,15 @@ class RLTradingStrategy(Strategy):
                 self.close_position(self._symbol, tag="eod_close")
             return
 
-        # ── 2. Trailing drawdown stop (hard rule) ────────────────────
-        if pos != 0 and self._entry_price > 0:
+        # ── 2. Hard stop: absolute + trailing drawdown ───────────────
+        if pos != 0:
+            # Fallback: if on_fill didn't capture the entry price (e.g. fill_price
+            # was None), use bar.open as the conservative entry estimate so the
+            # stop is never silently bypassed.
+            if self._entry_price == 0.0:
+                self._entry_price = bar.open
+                self._peak_unrealised = 0.0
+
             direction  = 1.0 if pos > 0 else -1.0
             unrealised = (
                 direction
@@ -121,12 +130,13 @@ class RLTradingStrategy(Strategy):
                 * abs(pos)
                 * bar.contract_multiplier
             )
-            # Update peak
+            # Update trailing peak
             if unrealised > self._peak_unrealised:
                 self._peak_unrealised = unrealised
-            # Stop out if we've fallen $max_loss from the peak
-            if self._peak_unrealised - unrealised >= self._max_loss:
-                self.close_position(self._symbol, tag="trailing_stop")
+            # Condition 1 — absolute hard stop: loss from entry >= $max_loss
+            # Condition 2 — trailing stop: drawdown from peak >= $max_loss
+            if unrealised <= -self._max_loss or self._peak_unrealised - unrealised >= self._max_loss:
+                self.close_position(self._symbol, tag="hard_stop")
                 return
 
         # ── 3. No new entries near EOD ───────────────────────────────

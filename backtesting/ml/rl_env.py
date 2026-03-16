@@ -146,7 +146,11 @@ class TradingEnv:
         mtm    = (curr_close - self._prev_close) * self._position * self.contracts * self.multiplier
         reward = (mtm - commission_paid) / self.reward_scale
 
-        # ── Trailing drawdown stop ────────────────────────────────────────
+        # ── Hard stop: absolute from entry + trailing drawdown ───────────
+        # Condition 1 — absolute: P&L < -max_loss from entry on ANY bar,
+        #   guaranteeing a hard $2 500 cap on every single trade.
+        # Condition 2 — trailing: drawdown from peak >= max_loss,
+        #   protecting profits on winning trades.
         if self._position != 0 and self._entry_price > 0.0:
             upnl = (
                 (curr_close - self._entry_price)
@@ -154,7 +158,7 @@ class TradingEnv:
             )
             if upnl > self._peak_unrealised:
                 self._peak_unrealised = upnl
-            if self._peak_unrealised - upnl >= self.max_loss:
+            if upnl <= -self.max_loss or self._peak_unrealised - upnl >= self.max_loss:
                 reward        -= (self.commission * self.contracts) / self.reward_scale
                 self._position        = 0
                 self._entry_price     = 0.0
@@ -343,11 +347,15 @@ class BatchedTradingEnv:
                    * new_pos * self.contracts * self.multiplier)
         rewards = (mtm - commission) / self.reward_scale
 
-        # Trailing drawdown stop — evaluated on NEW position / entry
+        # Hard stop: absolute from entry + trailing drawdown (vectorised)
+        # Condition 1 — absolute: upnl <= -max_loss (hard $2 500 cap from entry)
+        # Condition 2 — trailing: drawdown from peak >= max_loss
         has_pos  = (new_pos != 0) & (new_entry > 0.0)
         upnl     = (curr_closes - new_entry) * new_pos * self.contracts * self.multiplier
         new_peak = np.where(has_pos & (upnl > new_peak), upnl, new_peak)
-        stopped  = has_pos & ((new_peak - upnl) >= self.max_loss)
+        stopped  = has_pos & (
+            (upnl <= -self.max_loss) | ((new_peak - upnl) >= self.max_loss)
+        )
         rewards  -= stopped.astype(np.float32) * self.commission * self.contracts / self.reward_scale
         new_pos   = np.where(stopped, np.int32(0),     new_pos)
         new_entry = np.where(stopped, np.float32(0.0), new_entry)
