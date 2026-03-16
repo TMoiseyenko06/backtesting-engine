@@ -60,6 +60,7 @@ Options (supervised-specific)
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 import time
 from pathlib import Path
@@ -103,6 +104,20 @@ def _detect_device() -> dict:
 # ---------------------------------------------------------------------------
 # Telegram notification
 # ---------------------------------------------------------------------------
+
+def _load_dotenv(path: str = ".env") -> None:
+    """Parse a .env file and populate os.environ (existing vars take priority)."""
+    try:
+        with open(path) as f:
+            for line in f:
+                line = line.strip()
+                if not line or line.startswith("#") or "=" not in line:
+                    continue
+                key, _, val = line.partition("=")
+                os.environ.setdefault(key.strip(), val.strip().strip('"').strip("'"))
+    except FileNotFoundError:
+        pass
+
 
 def _notify_telegram(bot_token: str, chat_id: str, analytics, elapsed: float, mode: str) -> None:
     """
@@ -257,6 +272,7 @@ def _print_backtest_section(analytics, symbol: str, test_bars: int,
 # ---------------------------------------------------------------------------
 
 def _parse_args() -> argparse.Namespace:
+    _load_dotenv()
     p = argparse.ArgumentParser(
         description="Train LSTM on 80% of Databento OHLCV-1m data, "
                     "then backtest on the remaining 20%."
@@ -308,10 +324,10 @@ def _parse_args() -> argparse.Namespace:
                    help="Early-stop after this many iters with no val improvement (default 80, 0=off)")
     p.add_argument("--resume",             type=str,   default=None, dest="resume", metavar="PATH",
                    help="Path to .pt checkpoint to resume PPO training from (e.g. models/nq_lstm_ohlcv1m.pt)")
-    p.add_argument("--tg-token",   default="", dest="tg_token",
-                   help="Telegram bot token (from @BotFather)")
-    p.add_argument("--tg-chat",    default="", dest="tg_chat",
-                   help="Telegram chat ID to send notifications to")
+    p.add_argument("--tg-token",   default=os.environ.get("TELEGRAM_BOT_TOKEN", ""), dest="tg_token",
+                   help="Telegram bot token — overrides TELEGRAM_BOT_TOKEN in .env")
+    p.add_argument("--tg-chat",    default=os.environ.get("TELEGRAM_CHAT_ID", ""),   dest="tg_chat",
+                   help="Telegram chat ID — overrides TELEGRAM_CHAT_ID in .env")
     p.add_argument("--compile",            action="store_true",      dest="compile_model",
                    help="Enable torch.compile for fused CUDA kernels (PyTorch >= 2.0, ~10-30%% speedup)")
     return p.parse_args()
