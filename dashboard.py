@@ -67,7 +67,7 @@ with st.sidebar:
     st.markdown("**Model hyperparameters**")
     c1, c2 = st.columns(2)
     hidden     = c1.number_input("Hidden", 32, 512, 64,  step=32)
-    seq_len    = c1.number_input("Seq len", 10, 120, 30,  step=5)
+    seq_len    = c1.number_input("Seq len", 10, 240, 60,  step=10)
     folds      = c1.number_input("Folds",   1,  10,   3)
     epochs     = c2.number_input("Epochs",  5,  200, 50,  step=5)
     batch_size = c2.number_input("Batch",   64, 1024, 256, step=64)

@@ -540,7 +540,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--init-margin",  type=float, default=21_000.0, dest="init_margin")
     p.add_argument("--maint-margin", type=float, default=19_000.0, dest="maint_margin")
     p.add_argument("--contracts",    type=float, default=1.0)
-    p.add_argument("--seq-len",      type=int,   default=30,  dest="seq_len")
+    p.add_argument("--seq-len",      type=int,   default=60,  dest="seq_len",
+                   help="LSTM lookback window in bars (default: 60 = 1 hour on 1-min data)."
+                        " More bars = richer context but slower training."
+                        " Good range: 60 (1h) to 120 (2h).")
     p.add_argument("--conf",         type=float, default=0.50)
     p.add_argument("--folds",        type=int,   default=3)
     p.add_argument("--epochs",       type=int,   default=50)
