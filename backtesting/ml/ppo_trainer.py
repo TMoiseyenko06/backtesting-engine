@@ -107,7 +107,9 @@ class PPOTrainer:
         gamma:               float = 0.99,
         gae_lambda:          float = 0.95,
         value_loss_coef:     float = 0.25,   # reduced: return normalisation makes value loss O(1)
-        entropy_coef:        float = 0.05,   # higher → more exploration, prevents FLAT collapse
+        entropy_coef:        float = 0.01,   # starting entropy bonus — decays to entropy_coef_final
+        entropy_coef_final:  float = 0.001,  # final entropy_coef after linear annealing
+        entropy_target:      float = 0.5,    # V-shaped target: bonus below, penalty above (0=disabled)
         flat_penalty:        float = 1.0,    # dollar cost per flat bar — same order as commission
         pred_loss_coef:      float = 0.01,   # reduced: auxiliary task should not dominate policy
         prediction_horizon:  int   = 30,      # H-bar ahead prediction target
@@ -147,6 +149,8 @@ class PPOTrainer:
         self.gae_lambda         = gae_lambda
         self.value_loss_coef    = value_loss_coef
         self.entropy_coef       = entropy_coef
+        self.entropy_coef_final = entropy_coef_final
+        self.entropy_target     = entropy_target
         self.flat_penalty       = flat_penalty
         self.pred_loss_coef     = pred_loss_coef
         self.prediction_horizon = prediction_horizon
@@ -315,8 +319,17 @@ class PPOTrainer:
         best_state       = None
         iters_no_improve = 0
 
+        _entropy_coef_start = self.entropy_coef
+
         last_metrics: dict = {}
         for iteration in range(1, self.n_iterations + 1):
+            # Linear entropy annealing: start high for exploration, decay to near 0
+            progress = (iteration - 1) / max(self.n_iterations - 1, 1)
+            self.entropy_coef = (
+                _entropy_coef_start
+                + progress * (self.entropy_coef_final - _entropy_coef_start)
+            )
+
             rollout      = self._collect_rollout(train_episodes)
             self._compute_gae(rollout)
             metrics      = self._ppo_update(rollout)
@@ -514,6 +527,7 @@ class PPOTrainer:
         done_store    = np.zeros((n_ep, max_bars),                          dtype=bool)
         fret_store    = np.zeros((n_ep, max_bars),                          dtype=np.float32)
         entered_store = np.zeros((n_ep, max_bars),                          dtype=bool)
+        dec_store     = np.zeros((n_ep, max_bars),                          dtype=bool)
         lp_dir_store  = np.zeros((n_ep, max_bars),                          dtype=np.float32)
         lp_sl_store   = np.zeros((n_ep, max_bars),                          dtype=np.float32)
         lp_tp_store   = np.zeros((n_ep, max_bars),                          dtype=np.float32)
@@ -585,6 +599,11 @@ class PPOTrainer:
                 ep_t[active]    += 1
                 cursors[active] += 1
 
+                # Decision mask: True when the model's action actually matters.
+                # While in a bracket the env ignores direction; those steps
+                # must not drive the policy gradient or entropy term.
+                dec_store[active, t_active] = ~env._in_bracket[active]
+
                 # ── Vectorised env step ───────────────────────────────────
                 directions_all = np.zeros(n_ep, dtype=np.int32)
                 sl_all         = np.zeros(n_ep, dtype=np.float32)
@@ -632,7 +651,7 @@ class PPOTrainer:
         obs_c = []; act_c = []; sl_c  = []; tp_c  = []
         rew_c = []; don_c = []; frt_c = []; prd_c = []
         ent_c = []; lpd_c = []; lps_c = []; lpt_c = []
-        val_c = []
+        val_c = []; dec_c = []
 
         for i in range(n_ep):
             T = int(ep_t[i])
@@ -647,6 +666,7 @@ class PPOTrainer:
             frt_c.append(fret_store   [i, :T])
             prd_c.append(pr_store     [i, :T])
             ent_c.append(entered_store[i, :T])
+            dec_c.append(dec_store    [i, :T])
             lpd_c.append(lp_dir_store [i, :T])
             lps_c.append(lp_sl_store  [i, :T])
             lpt_c.append(lp_tp_store  [i, :T])
@@ -655,6 +675,7 @@ class PPOTrainer:
         fwd_np      = np.concatenate(frt_c, axis=0)
         pred_np     = np.concatenate(prd_c, axis=0)
         entered_np  = np.concatenate(ent_c, axis=0)
+        decision_np = np.concatenate(dec_c, axis=0)
         lp_dir_np   = np.concatenate(lpd_c, axis=0)
         lp_sl_np    = np.concatenate(lps_c, axis=0)
         lp_tp_np    = np.concatenate(lpt_c, axis=0)
@@ -677,6 +698,7 @@ class PPOTrainer:
             "dones":              np.concatenate(don_c, axis=0),
             "actual_fwd_rets":    fwd_np,
             "entered_bracket":    entered_np,
+            "decision_mask":      decision_np,
             "episode_returns":    ep_rets.tolist(),
             "pred_return_errors": np.abs(pred_np - fwd_np),
             "trades_per_day":     trades_per_day,
@@ -741,12 +763,14 @@ class PPOTrainer:
         old_vals_norm = torch.tensor(old_vals_norm_np,           device=self.device)
         advantages    = torch.tensor(rollout["advantages"],      device=self.device)
         actual_fwd    = torch.tensor(rollout["actual_fwd_rets"], device=self.device)
+        decision_mask = torch.tensor(rollout["decision_mask"],   device=self.device)
 
         advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
 
         dataset = TensorDataset(
             obs, actions, sl_samples, tp_samples, entered,
             old_lp, norm_returns, old_vals_norm, advantages, actual_fwd,
+            decision_mask,
         )
         loader = DataLoader(dataset, batch_size=self.minibatch_size, shuffle=True)
 
@@ -761,7 +785,7 @@ class PPOTrainer:
 
         for (batch_obs, batch_act, batch_sl, batch_tp, batch_entered,
              batch_old_lp, batch_norm_ret, batch_old_val_norm,
-             batch_adv, batch_fwd) in loader:
+             batch_adv, batch_fwd, batch_decision) in loader:
 
             self.optimiser.zero_grad()
 
@@ -772,7 +796,6 @@ class PPOTrainer:
                     # Discrete direction distribution
                     dir_dist   = Categorical(logits=logits)
                     new_lp_dir = dir_dist.log_prob(batch_act)
-                    entropy    = dir_dist.entropy().mean()
 
                     # Continuous SL/TP distributions (use policy's learnable std)
                     sl_std = self._policy.sl_log_std.exp().clamp(1.0, 200.0)
@@ -780,17 +803,26 @@ class PPOTrainer:
                     new_lp_sl = Normal(sl_mean, sl_std).log_prob(batch_sl)
                     new_lp_tp = Normal(tp_mean, tp_std).log_prob(batch_tp)
 
-                    # Direction-only ratio: SL/TP heads learn via shared backbone gradients
-                    new_lp = new_lp_dir
+                    # Decision mask: only steps where model action is not ignored.
+                    # In-bracket steps are excluded — env ignores direction while in
+                    # a bracket, so those steps contribute only noise to the gradient.
+                    dec_mask = batch_decision.bool()
+                    dec_f    = dec_mask.float()
+                    n_dec    = dec_f.sum().clamp(min=1.0)
 
+                    # Direction-only ratio restricted to decision steps
+                    new_lp = new_lp_dir
                     ratio     = torch.exp(new_lp - batch_old_lp)
-                    clip_frac = float(((ratio - 1.0).abs() > self.clip_eps).float().mean().item())
+                    clip_frac = float(
+                        ((ratio[dec_mask] - 1.0).abs() > self.clip_eps).float().mean().item()
+                        if dec_mask.any() else 0.0
+                    )
 
                     surr1  = ratio * batch_adv
                     surr2  = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * batch_adv
-                    l_clip = -torch.min(surr1, surr2).mean()
+                    l_clip = -(torch.min(surr1, surr2) * dec_f).sum() / n_dec
 
-                    # Value loss with clipping (PPO standard)
+                    # Value loss with clipping (PPO standard) — all steps, not just decision
                     v_clipped = batch_old_val_norm + torch.clamp(
                         values - batch_old_val_norm, -self.clip_eps, self.clip_eps
                     )
@@ -799,11 +831,21 @@ class PPOTrainer:
                         (v_clipped - batch_norm_ret).pow(2),
                     ).mean()
 
-                    loss = (
-                        l_clip
-                        + self.value_loss_coef * l_val
-                        - self.entropy_coef    * entropy
-                    )
+                    # Entropy restricted to decision steps only.
+                    # V-shaped entropy target: bonus when below target (encourages
+                    # exploration), penalty when above target (prevents uniform collapse).
+                    #   entropy < target → loss -= coef * entropy  (maximize)
+                    #   entropy > target → loss += coef * entropy  (minimize back to target)
+                    entropy = (dir_dist.entropy() * dec_f).sum() / n_dec
+                    if self.entropy_target > 0:
+                        entropy_reg = -self.entropy_coef * entropy + (
+                            self.entropy_coef * 2.0
+                            * torch.nn.functional.relu(entropy - self.entropy_target)
+                        )
+                    else:
+                        entropy_reg = -self.entropy_coef * entropy
+
+                    loss = l_clip + self.value_loss_coef * l_val + entropy_reg
 
                 # Pred loss computed in float32 outside amp_ctx to prevent bfloat16 overflow
                 batch_fwd_safe = batch_fwd.clamp(-0.05, 0.05).float()
@@ -834,7 +876,7 @@ class PPOTrainer:
 
         # Free the full rollout tensors from GPU now that all epochs are done.
         del obs, actions, sl_samples, tp_samples, entered
-        del old_lp, norm_returns, old_vals_norm, advantages, actual_fwd
+        del old_lp, norm_returns, old_vals_norm, advantages, actual_fwd, decision_mask
         del dataset, loader
         if self.device == "cuda":
             torch.cuda.empty_cache()

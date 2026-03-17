@@ -48,7 +48,7 @@ Options (RL-specific)
     --rl-days       Episodes (trading days) per PPO rollout (default: 16)
     --rl-ppo-epochs PPO update epochs per iteration (default: 4)
     --rl-lr         PPO Adam learning rate (default: 3e-4)
-    --entropy-coef  Entropy bonus (default: 0.05) — prevents FLAT collapse
+    --entropy-coef  Starting entropy bonus (default: 0.01) — decays to --entropy-coef-final
     --flat-penalty  Dollar cost per flat bar (default: 1.0) — incentivises trading frequency
                     Start with 0.5–1.0 for ~5 trades/day; same scale as commission ($2/side)
 
@@ -573,8 +573,12 @@ def _parse_args() -> argparse.Namespace:
                    help="PPO update epochs per iteration (default 4)")
     p.add_argument("--rl-lr",              type=float, default=3e-4, dest="rl_lr",
                    help="PPO Adam learning rate (default 3e-4)")
-    p.add_argument("--entropy-coef",       type=float, default=0.05, dest="entropy_coef",
-                   help="PPO entropy bonus coefficient — higher prevents FLAT collapse (default 0.05)")
+    p.add_argument("--entropy-coef",       type=float, default=0.01,  dest="entropy_coef",
+                   help="PPO starting entropy bonus (default 0.01, decays to --entropy-coef-final)")
+    p.add_argument("--entropy-coef-final", type=float, default=0.001, dest="entropy_coef_final",
+                   help="PPO final entropy bonus after linear annealing (default 0.001)")
+    p.add_argument("--entropy-target",     type=float, default=0.5,   dest="entropy_target",
+                   help="Entropy equilibrium target: bonus below, penalty above (default 0.5; 0=disabled)")
     p.add_argument("--flat-penalty",       type=float, default=1.0,  dest="flat_penalty",
                    help="Dollar penalty per flat bar during training — incentivises more trading "
                         "(default 1.0; same scale as commission)")
@@ -738,6 +742,8 @@ def main() -> None:
                 contracts=args.contracts,
                 max_loss=args.max_loss,
                 entropy_coef=args.entropy_coef,
+                entropy_coef_final=args.entropy_coef_final,
+                entropy_target=args.entropy_target,
                 flat_penalty=args.flat_penalty,
                 weight_decay=args.weight_decay,
                 val_frac=args.val_frac,
