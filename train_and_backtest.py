@@ -402,7 +402,22 @@ def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
                     entry_tp      = float(env._tp_prices[0])
                 elif in_trade:
                     trade_pnl_acc += rew_dollars
-                    if env._positions[0] == 0:           # SL/TP hit → bracket closed
+                    # Check EOD first: env zeros _positions on dones, so we must
+                    # not mistake an EOD forced-flat for an intraday SL/TP hit.
+                    if dones[0]:
+                        trade_pnls.append(trade_pnl_acc)
+                        trade_log.append({
+                            "entry_time":  entry_ts,
+                            "exit_time":   bar_ts,
+                            "direction":   "LONG" if entry_dir == 1 else "SHORT",
+                            "entry_price": entry_price,
+                            "sl_price":    entry_sl,
+                            "tp_price":    entry_tp,
+                            "exit_type":   "EOD",
+                            "pnl":         round(trade_pnl_acc, 2),
+                        })
+                        in_trade = False
+                    elif env._positions[0] == 0:         # intraday SL/TP hit
                         exit_type = "TP" if trade_pnl_acc > 0 else "SL"
                         trade_pnls.append(trade_pnl_acc)
                         trade_log.append({
@@ -419,19 +434,6 @@ def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
                         trade_pnl_acc = 0.0
 
                 if dones[0]:
-                    if in_trade:                         # EOD forced flat
-                        trade_pnls.append(trade_pnl_acc)
-                        trade_log.append({
-                            "entry_time":  entry_ts,
-                            "exit_time":   bar_ts,
-                            "direction":   "LONG" if entry_dir == 1 else "SHORT",
-                            "entry_price": entry_price,
-                            "sl_price":    entry_sl,
-                            "tp_price":    entry_tp,
-                            "exit_type":   "EOD",
-                            "pnl":         round(trade_pnl_acc, 2),
-                        })
-                        in_trade = False
                     break
 
         daily_pnls.append(day_pnl)
