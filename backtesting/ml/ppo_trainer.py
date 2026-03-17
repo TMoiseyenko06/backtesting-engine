@@ -123,7 +123,11 @@ class PPOTrainer:
         val_frac:            float = 0.15,    # fraction of training days held out for validation
         patience:            int   = 80,      # early-stop after this many iters with no val improvement
         pretrained_path:     Optional[str] = None,  # .pt checkpoint to resume from
+        fixed_sl_pts:        Optional[float] = None,  # if set, override model SL output
+        fixed_tp_pts:        Optional[float] = None,  # if set, override model TP output
     ) -> None:
+        self.fixed_sl_pts       = fixed_sl_pts
+        self.fixed_tp_pts       = fixed_tp_pts
         self.seq_len            = seq_len
         self.n_iterations       = n_iterations
         self.rollout_days       = rollout_days
@@ -384,8 +388,10 @@ class PPOTrainer:
 
                 logits, _, _, sl_mean, tp_mean = self._policy(x)
                 actions_np = logits.argmax(dim=-1).cpu().numpy()
-                sl_np      = sl_mean.cpu().numpy()
-                tp_np      = tp_mean.cpu().numpy()
+                sl_np = (np.full(len(active), self.fixed_sl_pts, dtype=np.float32)
+                         if self.fixed_sl_pts is not None else sl_mean.cpu().numpy())
+                tp_np = (np.full(len(active), self.fixed_tp_pts, dtype=np.float32)
+                         if self.fixed_tp_pts is not None else tp_mean.cpu().numpy())
 
                 # Map action ints to directions
                 directions_np = np.where(actions_np == 1, np.int32(1),
@@ -496,8 +502,10 @@ class PPOTrainer:
 
                 # ONE sync per step: actions + sl/tp needed on CPU for env
                 actions_np = actions_t.cpu().numpy()
-                sl_np      = sl_t.cpu().numpy()
-                tp_np      = tp_t.cpu().numpy()
+                sl_np = (np.full(len(active), self.fixed_sl_pts, dtype=np.float32)
+                         if self.fixed_sl_pts is not None else sl_t.cpu().numpy())
+                tp_np = (np.full(len(active), self.fixed_tp_pts, dtype=np.float32)
+                         if self.fixed_tp_pts is not None else tp_t.cpu().numpy())
 
                 # Map action ints {0,1,2} → directions {0,+1,-1}
                 directions_np = np.where(actions_np == 1, np.int32(1),

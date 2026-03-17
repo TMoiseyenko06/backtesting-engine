@@ -311,7 +311,9 @@ def _build_test_episodes(
 
 def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
                  device: str, initial_cash: float,
-                 trade_log_path: str | None = None):
+                 trade_log_path: str | None = None,
+                 fixed_sl_pts: float | None = None,
+                 fixed_tp_pts: float | None = None):
     """
     Run the trained model greedily on every test episode using BatchedTradingEnv.
     Identical evaluation logic to PPOTrainer._evaluate_val(), run day-by-day so
@@ -358,8 +360,12 @@ def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
                 logits, _, _, sl_mean, tp_mean = model(x)
 
                 actions = logits.argmax(dim=-1).cpu().numpy()   # (1,)
-                sl_arr  = sl_mean.cpu().numpy().flatten()        # (1,)
-                tp_arr  = tp_mean.cpu().numpy().flatten()        # (1,)
+                sl_arr  = (np.array([fixed_sl_pts], dtype=np.float32)
+                           if fixed_sl_pts is not None
+                           else sl_mean.cpu().numpy().flatten())
+                tp_arr  = (np.array([fixed_tp_pts], dtype=np.float32)
+                           if fixed_tp_pts is not None
+                           else tp_mean.cpu().numpy().flatten())
 
                 directions = np.where(
                     actions == 1, np.int32(1),
@@ -588,6 +594,14 @@ def _parse_args() -> argparse.Namespace:
                    help="CSV file to write per-trade log after backtesting (default: logs/trade_log.csv)")
     p.add_argument("--compile",            action="store_true",      dest="compile_model",
                    help="Enable torch.compile for fused CUDA kernels (PyTorch >= 2.0, ~10-30%% speedup)")
+    p.add_argument("--sl-pts",  type=float, default=None, dest="sl_pts",
+                   metavar="PTS",
+                   help="Fixed SL distance in points (e.g. 100). Overrides model SL head."
+                        " When set, every trade uses exactly this stop-loss distance.")
+    p.add_argument("--tp-pts",  type=float, default=None, dest="tp_pts",
+                   metavar="PTS",
+                   help="Fixed TP distance in points (e.g. 200). Overrides model TP head."
+                        " When set, every trade uses exactly this take-profit distance.")
     return p.parse_args()
 
 
@@ -690,6 +704,8 @@ def main() -> None:
                 val_frac=args.val_frac,
                 patience=args.patience,
                 pretrained_path=args.resume,
+                fixed_sl_pts=args.sl_pts,
+                fixed_tp_pts=args.tp_pts,
             )
             rl_metrics = ppo_trainer.fit(train_bars, features)
             elapsed = time.time() - t0
@@ -729,7 +745,9 @@ def main() -> None:
         print(f"  {len(test_episodes)} test-set trading days", flush=True)
         print("  Running NN backtest on test set …", flush=True)
         analytics = _nn_backtest(trained_model, test_episodes, env_kwargs, device, args.cash,
-                                  trade_log_path=args.trade_log)
+                                  trade_log_path=args.trade_log,
+                                  fixed_sl_pts=args.sl_pts,
+                                  fixed_tp_pts=args.tp_pts)
 
     else:
         # ── Supervised walk-forward training ─────────────────────────
