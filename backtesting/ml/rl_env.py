@@ -104,9 +104,12 @@ class TradingEnv:
         contracts:    float = 1.0,
         max_loss:     float = 2_500.0,
         reward_scale: float = 100.0,
-        flat_penalty:   float = 0.0,
-        win_bonus:      float = 0.0,
-        binary_reward:  bool  = False,
+        flat_penalty:           float = 0.0,
+        win_bonus:              float = 0.0,
+        binary_reward:          bool  = False,
+        time_limit_bars:        int   = 0,
+        max_trades_per_episode: int   = 0,
+        **_kwargs,   # absorb any future BatchedTradingEnv-only params
     ) -> None:
         self.seq_len      = seq_len
         self.n_features   = n_features
