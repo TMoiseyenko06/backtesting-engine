@@ -1,0 +1,66 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Live Trading Configuration
+# Copy this file to live_config.yaml and fill in your credentials.
+# DO NOT commit live_config.yaml to git (it contains secrets).
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── Model ─────────────────────────────────────────────────────────────────────
+# Path to a trained ActorCriticLSTM (.pt file).
+# Train with: python train_and_backtest.py data.dbn --rl --rl-iters 300
+model_path: "models/nq_lstm_ohlcv1m.pt"
+seq_len: 30          # must match --seq-len used during training
+hidden_size: 512     # must match --hidden used during training
+device: "cpu"        # "cpu" or "cuda"
+
+# ── Databento (real-time market data) ─────────────────────────────────────────
+# Sign up at https://databento.com
+# Cost: ~$0.27/GB pay-as-you-go. NQ 1m bars ≈ $0.01/day.
+# Free $125 credit on signup (covers months of live trading data).
+databento_key: "YOUR_DATABENTO_API_KEY"
+
+# Databento continuous contract symbols:
+#   NQ.c.0  = Nasdaq-100 E-mini (front month)
+#   ES.c.0  = S&P 500 E-mini
+#   CL.c.0  = Crude Oil
+#   GC.c.0  = Gold
+symbol: "NQ.c.0"
+dataset: "GLBX.MDP3"   # CME Globex — do not change
+
+# ── PickMyTrade (trade execution) ─────────────────────────────────────────────
+# 1. Create account at https://pickmytrade.trade
+# 2. Connect your broker (Tradovate, Rithmic, IB, TradeStation, etc.)
+# 3. Copy token + account_id from your dashboard → Alert Generator
+pickmytrade_token: "YOUR_PICKMYTRADE_TOKEN"
+pickmytrade_account_id: "YOUR_ACCOUNT_ID"
+
+# Webhook URL — use the one matching your broker:
+#   Tradovate : https://api.pickmytrade.trade/v2/add-trade-data
+#   All others: https://api.pickmytrade.io/v2/add-trade-data
+pickmytrade_url: "https://api.pickmytrade.trade/v2/add-trade-data"
+
+# Close any open position before entering a new one (strongly recommended)
+reverse_order_close: true
+
+# ── Trading rules ──────────────────────────────────────────────────────────────
+contracts: 1           # number of contracts per trade
+multiplier: 20.0       # NQ = $20/point  |  ES = $50/point
+
+# Intraday-only rules (timestamps are UTC)
+eod_hour_utc: 20       # 20:00 UTC = 4:00 PM EDT — force flat at this hour
+no_entry_hour_utc: 19  # 19:00 UTC = 3:00 PM EDT — no new entries after this
+
+reward_scale: 100.0    # must match the reward_scale used during PPO training
+max_loss_usd: 2500.0   # hard stop per trade in USD
+
+# ── SL/TP overrides ───────────────────────────────────────────────────────────
+# Set > 0 to use a fixed bracket instead of the model's dynamic prediction.
+# 0 means "use whatever the model predicts".
+#
+# Example (from your backtesting results with Option B):
+#   sl_pts_override: 50    # 50 NQ points = $1,000 per contract
+#   tp_pts_override: 75    # 75 NQ points = $1,500 per contract
+sl_pts_override: 0
+tp_pts_override: 0
+
+# ── Misc ──────────────────────────────────────────────────────────────────────
+log_level: "INFO"   # DEBUG / INFO / WARNING / ERROR

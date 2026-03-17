@@ -8,3 +8,5 @@ build/
 .env
 *.csv
 *.parquet
+# Live trading — contains API keys, never commit
+live_config.yaml
