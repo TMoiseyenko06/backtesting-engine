@@ -169,6 +169,8 @@ class BatchedTradingEnv:
         self.reward_scale = reward_scale
         self.flat_penalty = flat_penalty
         self.win_bonus    = win_bonus
+        self.tp_hit_total = 0
+        self.sl_hit_total = 0
 
         # Allocated in reset_all — episode data (padded 2D arrays)
         self._features  : np.ndarray | None = None  # (n, max_bars, n_features)
@@ -222,6 +224,8 @@ class BatchedTradingEnv:
         self._tp_prices    = np.zeros(n, dtype=np.float32)
         self._in_bracket   = np.zeros(n, dtype=bool)
         self._prev_closes  = self._prices[self._ei, self.seq_len - 1]
+        self.tp_hit_total  = 0
+        self.sl_hit_total  = 0
         return self._build_states()
 
     # ------------------------------------------------------------------
@@ -273,6 +277,8 @@ class BatchedTradingEnv:
         # If both hit on same bar, SL takes precedence (conservative)
         tp_hit       = tp_hit & ~sl_hit
         bracket_exit = sl_hit | tp_hit
+        self.tp_hit_total += int(tp_hit.sum())
+        self.sl_hit_total += int(sl_hit.sum())
 
         # ── 2. MTM reward using actual exit price for bracket exits ────
         # For bars where SL fires, price moved to sl_price; for TP, to tp_price.

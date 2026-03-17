@@ -126,9 +126,11 @@ class PPOTrainer:
         fixed_sl_pts:        Optional[float] = None,  # if set, override model SL output
         fixed_tp_pts:        Optional[float] = None,  # if set, override model TP output
         win_bonus:           float = 0.0,   # $ bonus on TP hit / penalty on SL hit
+        val_winrate_coef:    float = 0.0,   # winrate weight in model selection score
     ) -> None:
         self.fixed_sl_pts       = fixed_sl_pts
         self.fixed_tp_pts       = fixed_tp_pts
+        self.val_winrate_coef   = val_winrate_coef
         self.seq_len            = seq_len
         self.n_iterations       = n_iterations
         self.rollout_days       = rollout_days
@@ -267,8 +269,8 @@ class PPOTrainer:
             f"{self.ppo_epochs} PPO epochs/iter\n"
         )
 
-        best_val_pnl   = -float("inf")
-        best_state     = None
+        best_val_score   = -float("inf")
+        best_state       = None
         iters_no_improve = 0
 
         last_metrics: dict = {}
@@ -286,13 +288,14 @@ class PPOTrainer:
             ) if len(rollout.get("pred_return_errors", [])) > 0 else 0.0
 
             if iteration % self.print_every == 0 or iteration == 1:
-                val_pnl = self._evaluate_val(val_episodes)
-                last_metrics["val_pnl"] = val_pnl
+                val_score, val_winrate = self._evaluate_val(val_episodes)
+                last_metrics["val_pnl"]     = val_score
+                last_metrics["val_winrate"] = val_winrate
 
-                improved = val_pnl > best_val_pnl
+                improved = val_score > best_val_score
                 if improved:
-                    best_val_pnl = val_pnl
-                    best_state   = {k: v.cpu().clone() for k, v in self._policy.state_dict().items()}
+                    best_val_score = val_score
+                    best_state     = {k: v.cpu().clone() for k, v in self._policy.state_dict().items()}
                     iters_no_improve = 0
                 else:
                     iters_no_improve += self.print_every
@@ -301,7 +304,7 @@ class PPOTrainer:
                 print(
                     f"    iter {iteration:>4}  "
                     f"train_pnl=${last_metrics['mean_episode_pnl']:+.0f}  "
-                    f"val_pnl=${val_pnl:+.0f}{flag}  "
+                    f"val_score={val_score:+.0f}  val_wr={val_winrate:.1%}{flag}  "
                     f"trades/day={last_metrics['trades_per_day']:.1f}  "
                     f"policy={metrics['policy_loss']:.4f}  "
                     f"value={metrics['value_loss']:.4f}  "
@@ -311,8 +314,8 @@ class PPOTrainer:
 
                 if self.patience > 0 and iters_no_improve >= self.patience:
                     print(
-                        f"  [early stop] val_pnl has not improved for {self.patience} iters  "
-                        f"·  best val_pnl=${best_val_pnl:+.0f}"
+                        f"  [early stop] val_score has not improved for {self.patience} iters  "
+                        f"·  best score={best_val_score:+.0f}"
                     )
                     break
 
@@ -320,7 +323,7 @@ class PPOTrainer:
             self._policy.load_state_dict(
                 {k: v.to(self.device) for k, v in best_state.items()}
             )
-            print(f"  [PPO] restored best model  (val_pnl=${best_val_pnl:+.0f})")
+            print(f"  [PPO] restored best model  (val_score={best_val_score:+.0f})")
 
         return last_metrics
 
@@ -371,10 +374,12 @@ class PPOTrainer:
     # Validation evaluation (greedy policy, no gradient)
     # ------------------------------------------------------------------
 
-    def _evaluate_val(self, val_episodes: list) -> float:
+    def _evaluate_val(self, val_episodes: list) -> tuple[float, float]:
         """
         Run the current policy greedily on val_episodes.
-        Returns mean daily PnL in dollars.
+        Returns (composite_score, winrate).
+          composite_score = mean_daily_pnl + val_winrate_coef * winrate
+          winrate         = tp_hits / (tp_hits + sl_hits), or 0.5 if no trades.
         """
         self._policy.eval()
         n_ep        = len(val_episodes)
@@ -410,7 +415,11 @@ class PPOTrainer:
                 ep_rets     += rews * active_mask.astype(np.float32)
                 active_mask &= ~dones
 
-        return float(ep_rets.mean()) * self.reward_scale
+        pnl        = float(ep_rets.mean()) * self.reward_scale
+        total_bkt  = env.tp_hit_total + env.sl_hit_total
+        winrate    = env.tp_hit_total / total_bkt if total_bkt > 0 else 0.5
+        score      = pnl + self.val_winrate_coef * winrate
+        return score, winrate
 
     # ------------------------------------------------------------------
     # Rollout collection

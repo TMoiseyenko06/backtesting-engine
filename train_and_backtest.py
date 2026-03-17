@@ -599,6 +599,12 @@ def _parse_args() -> argparse.Namespace:
                    help="Dollar bonus added to reward on TP hit, subtracted on SL hit."
                         " Trains the model to care about winrate independently of P&L magnitude."
                         " Good starting point: 100-500. Default: 0 (off).")
+    p.add_argument("--val-winrate-coef", type=float, default=0.0, dest="val_winrate_coef",
+                   metavar="DOLLARS",
+                   help="Winrate weight in model selection score: score = val_pnl + coef * winrate."
+                        " The best checkpoint saved is now the one with the highest combined score."
+                        " E.g. 5000 means a 10%% winrate improvement is worth $500/day in selection."
+                        " Default: 0 (select purely on P&L).")
     p.add_argument("--sl-pts",  type=float, default=None, dest="sl_pts",
                    metavar="PTS",
                    help="Fixed SL distance in points (e.g. 100). Overrides model SL head."
@@ -712,6 +718,7 @@ def main() -> None:
                 fixed_sl_pts=args.sl_pts,
                 fixed_tp_pts=args.tp_pts,
                 win_bonus=args.win_bonus,
+                val_winrate_coef=args.val_winrate_coef,
             )
             rl_metrics = ppo_trainer.fit(train_bars, features)
             elapsed = time.time() - t0
