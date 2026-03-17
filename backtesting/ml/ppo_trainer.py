@@ -100,7 +100,7 @@ class PPOTrainer:
         seq_len:             int   = 30,
         lr:                  float = 3e-4,
         n_iterations:        int   = 200,
-        rollout_days:        int   = 16,
+        rollout_days:        int   = 128,
         ppo_epochs:          int   = 4,
         minibatch_size:      int   = 512,
         clip_eps:            float = 0.2,

@@ -45,7 +45,7 @@ Options (shared)
 Options (RL-specific)
 ---------------------
     --rl-iters      PPO training iterations (default: 200)
-    --rl-days       Episodes (trading days) per PPO rollout (default: 16)
+    --rl-days       Episodes (trading days) per PPO rollout (default: 128)
     --rl-ppo-epochs PPO update epochs per iteration (default: 4)
     --rl-lr         PPO Adam learning rate (default: 3e-4)
     --entropy-coef  Starting entropy bonus (default: 0.01) — decays to --entropy-coef-final
@@ -567,7 +567,7 @@ def _parse_args() -> argparse.Namespace:
     # RL-specific
     p.add_argument("--rl-iters",           type=int,   default=200,  dest="rl_iters",
                    help="PPO training iterations (default 200)")
-    p.add_argument("--rl-days",            type=int,   default=16,   dest="rl_days",
+    p.add_argument("--rl-days",            type=int,   default=128,  dest="rl_days",
                    help="Episodes per PPO rollout (default 16)")
     p.add_argument("--rl-ppo-epochs",      type=int,   default=4,    dest="rl_ppo_epochs",
                    help="PPO update epochs per iteration (default 4)")
