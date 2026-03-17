@@ -624,6 +624,11 @@ def _parse_args() -> argparse.Namespace:
                         " (= 30 min on 1-min data).  Works with both standard and binary reward"
                         " modes; in binary mode the penalty equals -1.0 (same as an SL hit)."
                         " Trains the model to only enter when a fast, decisive move is expected.")
+    p.add_argument("--max-trades", type=int, default=0, dest="max_trades_per_episode",
+                   metavar="N",
+                   help="Maximum trades per episode (day).  0 = unlimited (default)."
+                        " Once N trades have been taken the model is locked out for the"
+                        " rest of that day, forcing selectivity.  E.g. --max-trades 3.")
     p.add_argument("--sl-pts",  type=float, default=None, dest="sl_pts",
                    metavar="PTS",
                    help="Fixed SL distance in points (e.g. 100). Overrides model SL head."
@@ -740,6 +745,7 @@ def main() -> None:
                 val_winrate_coef=args.val_winrate_coef,
                 binary_reward=args.binary_reward,
                 time_limit_bars=args.time_limit_bars,
+                max_trades_per_episode=args.max_trades_per_episode,
             )
             rl_metrics = ppo_trainer.fit(train_bars, features)
             elapsed = time.time() - t0
@@ -775,6 +781,7 @@ def main() -> None:
             win_bonus=args.win_bonus,
             binary_reward=args.binary_reward,
             time_limit_bars=args.time_limit_bars,
+            max_trades_per_episode=args.max_trades_per_episode,
         )
         test_episodes = _build_test_episodes(
             test_bars, test_features, args.seq_len, args.prediction_horizon

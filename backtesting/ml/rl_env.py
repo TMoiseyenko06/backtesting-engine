@@ -179,24 +179,26 @@ class BatchedTradingEnv:
         contracts:    float = 1.0,
         max_loss:     float = 2_500.0,
         reward_scale: float = 100.0,
-        flat_penalty:    float = 0.0,
-        win_bonus:       float = 0.0,
-        binary_reward:   bool  = False,
-        time_limit_bars: int   = 0,    # 0 = disabled; >0 = force exit + penalty after N bars
+        flat_penalty:         float = 0.0,
+        win_bonus:            float = 0.0,
+        binary_reward:        bool  = False,
+        time_limit_bars:      int   = 0,   # 0 = disabled; >0 = force exit + penalty after N bars
+        max_trades_per_episode: int = 0,   # 0 = unlimited; >0 = cap entries per day
     ) -> None:
-        self.n_envs          = n_envs
-        self.seq_len         = seq_len
-        self.n_features      = n_features
-        self.state_dim       = n_features + TradingEnv.N_EXTRA
-        self.multiplier      = multiplier
+        self.n_envs                = n_envs
+        self.seq_len               = seq_len
+        self.n_features            = n_features
+        self.state_dim             = n_features + TradingEnv.N_EXTRA
+        self.multiplier            = multiplier
         self.commission      = commission
         self.contracts       = contracts
         self.max_loss        = max_loss
         self.reward_scale    = reward_scale
         self.flat_penalty    = flat_penalty
         self.win_bonus       = win_bonus
-        self.binary_reward   = binary_reward
-        self.time_limit_bars = time_limit_bars
+        self.binary_reward          = binary_reward
+        self.time_limit_bars        = time_limit_bars
+        self.max_trades_per_episode = max_trades_per_episode
         self.tp_hit_total      = 0
         self.sl_hit_total      = 0
         self.timeout_hit_total = 0
@@ -216,8 +218,9 @@ class BatchedTradingEnv:
         self._tp_prices    : np.ndarray | None = None  # (n,) float32 absolute TP
         self._in_bracket   : np.ndarray | None = None  # (n,) bool
         self._prev_closes  : np.ndarray | None = None  # (n,) float32 for MTM
-        self._bars_in_trade: np.ndarray | None = None  # (n,) int32 — bars elapsed since entry
-        self._ei           : np.ndarray | None = None  # np.arange(n), cached
+        self._bars_in_trade      : np.ndarray | None = None  # (n,) int32 — bars elapsed since entry
+        self._trades_this_episode: np.ndarray | None = None  # (n,) int32 — entries taken today
+        self._ei                 : np.ndarray | None = None  # np.arange(n), cached
 
     # ------------------------------------------------------------------
 
@@ -252,8 +255,9 @@ class BatchedTradingEnv:
         self._entry_prices   = np.zeros(n, dtype=np.float32)
         self._sl_prices      = np.zeros(n, dtype=np.float32)
         self._tp_prices      = np.zeros(n, dtype=np.float32)
-        self._in_bracket     = np.zeros(n, dtype=bool)
-        self._bars_in_trade  = np.zeros(n, dtype=np.int32)
+        self._in_bracket          = np.zeros(n, dtype=bool)
+        self._bars_in_trade       = np.zeros(n, dtype=np.int32)
+        self._trades_this_episode = np.zeros(n, dtype=np.int32)
         self._prev_closes    = self._prices[self._ei, self.seq_len - 1]
         self.tp_hit_total      = 0
         self.sl_hit_total      = 0
@@ -343,7 +347,12 @@ class BatchedTradingEnv:
         post_exit_in_b  = self._in_bracket & ~bracket_exit
 
         # ── 4. New entries: only for flat envs not in bracket ──────────
-        can_enter   = ~post_exit_in_b & (post_exit_pos == 0) & (directions != 0)
+        # Also enforce max_trades_per_episode when set (0 = unlimited).
+        trade_quota_ok = (
+            (self.max_trades_per_episode <= 0) |
+            (self._trades_this_episode < self.max_trades_per_episode)
+        )
+        can_enter   = ~post_exit_in_b & (post_exit_pos == 0) & (directions != 0) & trade_quota_ok
         entry_price = curr_closes   # enter at current bar's close
 
         dir_f       = directions.astype(np.float32)
@@ -390,6 +399,7 @@ class BatchedTradingEnv:
         self._in_bracket   = new_in_b
         self._prev_closes  = curr_closes
         self._cursors     += 1
+        self._trades_this_episode += can_enter.astype(np.int32)
 
         # Update bars-in-trade counter:
         #   exited (any reason) or EOD → 0
