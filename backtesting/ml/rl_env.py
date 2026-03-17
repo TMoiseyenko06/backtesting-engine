@@ -82,6 +82,7 @@ class TradingEnv:
         max_loss:     float = 2_500.0,
         reward_scale: float = 100.0,
         flat_penalty: float = 0.0,
+        win_bonus:    float = 0.0,
     ) -> None:
         self.seq_len      = seq_len
         self.n_features   = n_features
