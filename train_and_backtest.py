@@ -651,9 +651,13 @@ def main() -> None:
     from backtesting.loaders.databento import from_databento_file
     from backtesting.ml.features import make_features
 
-    # ── 1. GPU detection ──────────────────────────────────────────────────
+    # ── 1. GPU detection + VRAM reset ─────────────────────────────────────
     device_info = _detect_device()
     device = device_info["device"]
+    if device == "cuda":
+        import torch as _torch
+        _torch.cuda.empty_cache()
+        _torch.cuda.reset_peak_memory_stats()
 
     mode_label = "PPO-RL" if args.rl else "SUPERVISED"
     print()
