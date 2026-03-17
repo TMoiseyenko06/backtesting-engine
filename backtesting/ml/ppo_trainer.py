@@ -130,6 +130,9 @@ class PPOTrainer:
         binary_reward:          bool  = False, # replace MTM with ±1 on TP/SL; pure win-rate signal
         time_limit_bars:        int   = 0,     # force exit + penalty if trade unresolved after N bars
         max_trades_per_episode: int   = 0,     # 0 = unlimited; cap entries per episode (day)
+        tg_token:               str   = "",    # Telegram bot token for iter notifications
+        tg_chat:                str   = "",    # Telegram chat ID for iter notifications
+        checkpoint_path:        Optional[str] = None,  # auto-save best model here on improvement
     ) -> None:
         self.fixed_sl_pts       = fixed_sl_pts
         self.fixed_tp_pts       = fixed_tp_pts
@@ -153,6 +156,9 @@ class PPOTrainer:
         self.device             = device or _auto_device()
         self.val_frac           = val_frac
         self.patience           = patience
+        self._tg_token          = tg_token
+        self._tg_chat           = tg_chat
+        self._checkpoint_path   = checkpoint_path
 
         # Store kwargs so _collect_rollout can spin up per-episode envs
         self._env_kwargs = dict(
@@ -247,6 +253,36 @@ class PPOTrainer:
             print(f"  Resumed weights from {pretrained_path}")
 
     # ------------------------------------------------------------------
+    # Telegram helper
+    # ------------------------------------------------------------------
+
+    def _send_iter_telegram(self, iteration: int, n_iterations: int, metrics: dict, improved: bool) -> None:
+        """Send a per-iteration progress message to Telegram. Best-effort, never raises."""
+        if not self._tg_token or not self._tg_chat:
+            return
+        import urllib.request, urllib.parse
+        flag = " ✅" if improved else ""
+        msg = (
+            f"*PPO iter {iteration}/{n_iterations}*{flag}\n"
+            f"train\\_pnl: `${metrics.get('mean_episode_pnl', 0):+.0f}`  "
+            f"val\\_score: `{metrics.get('val_pnl', 0):+.0f}`  "
+            f"val\\_wr: `{metrics.get('val_winrate', 0):.1%}`\n"
+            f"trades/day: `{metrics.get('trades_per_day', 0):.1f}`  "
+            f"entropy: `{metrics.get('entropy', 0):.4f}`  "
+            f"clip: `{metrics.get('clip_frac', 0):.3f}`"
+        )
+        params = urllib.parse.urlencode({
+            "chat_id": self._tg_chat,
+            "text": msg,
+            "parse_mode": "Markdown",
+        }).encode()
+        try:
+            url = f"https://api.telegram.org/bot{self._tg_token}/sendMessage"
+            urllib.request.urlopen(urllib.request.Request(url, data=params), timeout=10)
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------------
     # Public API
     # ------------------------------------------------------------------
 
@@ -303,9 +339,15 @@ class PPOTrainer:
                     best_val_score = val_score
                     best_state     = {k: v.cpu().clone() for k, v in self._policy.state_dict().items()}
                     iters_no_improve = 0
+                    if self._checkpoint_path:
+                        try:
+                            torch.save(best_state, self._checkpoint_path)
+                        except Exception as exc:
+                            print(f"  [checkpoint] WARNING: could not save to {self._checkpoint_path}: {exc}")
                 else:
                     iters_no_improve += self.print_every
 
+                self._send_iter_telegram(iteration, self.n_iterations, last_metrics, improved)
                 flag = " *" if improved else ""
                 print(
                     f"    iter {iteration:>4}  "

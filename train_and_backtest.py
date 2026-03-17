@@ -750,6 +750,9 @@ def main() -> None:
                 binary_reward=args.binary_reward,
                 time_limit_bars=args.time_limit_bars,
                 max_trades_per_episode=args.max_trades_per_episode,
+                tg_token=args.tg_token,
+                tg_chat=args.tg_chat,
+                checkpoint_path=(f"{model_path}.best.pt" if model_path else None),
             )
             rl_metrics = ppo_trainer.fit(train_bars, features)
             elapsed = time.time() - t0
