@@ -594,6 +594,11 @@ def _parse_args() -> argparse.Namespace:
                    help="CSV file to write per-trade log after backtesting (default: logs/trade_log.csv)")
     p.add_argument("--compile",            action="store_true",      dest="compile_model",
                    help="Enable torch.compile for fused CUDA kernels (PyTorch >= 2.0, ~10-30%% speedup)")
+    p.add_argument("--win-bonus", type=float, default=0.0, dest="win_bonus",
+                   metavar="DOLLARS",
+                   help="Dollar bonus added to reward on TP hit, subtracted on SL hit."
+                        " Trains the model to care about winrate independently of P&L magnitude."
+                        " Good starting point: 100-500. Default: 0 (off).")
     p.add_argument("--sl-pts",  type=float, default=None, dest="sl_pts",
                    metavar="PTS",
                    help="Fixed SL distance in points (e.g. 100). Overrides model SL head."
@@ -706,6 +711,7 @@ def main() -> None:
                 pretrained_path=args.resume,
                 fixed_sl_pts=args.sl_pts,
                 fixed_tp_pts=args.tp_pts,
+                win_bonus=args.win_bonus,
             )
             rl_metrics = ppo_trainer.fit(train_bars, features)
             elapsed = time.time() - t0
@@ -738,6 +744,7 @@ def main() -> None:
             max_loss=args.max_loss,
             reward_scale=100.0,
             flat_penalty=args.flat_penalty,
+            win_bonus=args.win_bonus,
         )
         test_episodes = _build_test_episodes(
             test_bars, test_features, args.seq_len, args.prediction_horizon

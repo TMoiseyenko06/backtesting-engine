@@ -125,6 +125,7 @@ class PPOTrainer:
         pretrained_path:     Optional[str] = None,  # .pt checkpoint to resume from
         fixed_sl_pts:        Optional[float] = None,  # if set, override model SL output
         fixed_tp_pts:        Optional[float] = None,  # if set, override model TP output
+        win_bonus:           float = 0.0,   # $ bonus on TP hit / penalty on SL hit
     ) -> None:
         self.fixed_sl_pts       = fixed_sl_pts
         self.fixed_tp_pts       = fixed_tp_pts
@@ -158,6 +159,7 @@ class PPOTrainer:
             max_loss=max_loss,
             reward_scale=reward_scale,
             flat_penalty=flat_penalty,
+            win_bonus=win_bonus,
         )
         self._env = TradingEnv(**self._env_kwargs)   # kept for external callers
 

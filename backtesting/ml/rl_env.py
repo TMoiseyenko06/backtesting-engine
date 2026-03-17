@@ -155,6 +155,7 @@ class BatchedTradingEnv:
         max_loss:     float = 2_500.0,
         reward_scale: float = 100.0,
         flat_penalty: float = 0.0,
+        win_bonus:    float = 0.0,
     ) -> None:
         self.n_envs       = n_envs
         self.seq_len      = seq_len
@@ -166,6 +167,7 @@ class BatchedTradingEnv:
         self.max_loss     = max_loss
         self.reward_scale = reward_scale
         self.flat_penalty = flat_penalty
+        self.win_bonus    = win_bonus
 
         # Allocated in reset_all — episode data (padded 2D arrays)
         self._features  : np.ndarray | None = None  # (n, max_bars, n_features)
@@ -311,7 +313,13 @@ class BatchedTradingEnv:
         # (not on entry bars — those already pay commission).
         # Re-compute using can_enter so entry bars are excluded.
         flat_cost = ((post_exit_pos == 0) & ~can_enter).astype(np.float32) * self.flat_penalty
-        rewards   = (mtm - exit_commission - flat_cost) / self.reward_scale
+
+        # Win/loss bonus: extra reward signal for *how* the bracket closed,
+        # independent of dollar P&L. Encourages the model to be selective and
+        # only enter when it expects to hit TP (important for prop firm winrate).
+        win_loss_bonus = (tp_hit.astype(np.float32) - sl_hit.astype(np.float32)) * self.win_bonus
+
+        rewards   = (mtm - exit_commission - flat_cost + win_loss_bonus) / self.reward_scale
 
         # Entry commission
         rewards -= (can_enter.astype(np.float32)
