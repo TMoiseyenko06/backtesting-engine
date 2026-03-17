@@ -423,6 +423,8 @@ class PPOTrainer:
         total_bkt  = env.tp_hit_total + env.sl_hit_total + env.timeout_hit_total
         winrate    = env.tp_hit_total / total_bkt if total_bkt > 0 else 0.5
         score      = pnl + self.val_winrate_coef * winrate
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
         return score, winrate
 
     # ------------------------------------------------------------------
@@ -567,6 +569,10 @@ class PPOTrainer:
         all_v      = torch.cat(gpu_values    ).cpu().numpy()
         all_pr     = torch.cat(gpu_pred_rets ).cpu().numpy()
 
+        # Free GPU memory held by the accumulation lists
+        del gpu_lp_dir, gpu_lp_sl, gpu_lp_tp, gpu_sl, gpu_tp, gpu_values, gpu_pred_rets
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
         # Scatter into 2D stores (~max_bars iterations, not n_ep×max_bars)
         offset = 0
         for act_step, t_step in zip(active_hist, steps_hist):
@@ -715,62 +721,79 @@ class PPOTrainer:
 
             self.optimiser.zero_grad()
 
-            with amp_ctx:
-                logits, values, pred_returns, sl_mean, tp_mean = self.model(batch_obs)
+            try:
+                with amp_ctx:
+                    logits, values, pred_returns, sl_mean, tp_mean = self.model(batch_obs)
 
-                # Discrete direction distribution
-                dir_dist   = Categorical(logits=logits)
-                new_lp_dir = dir_dist.log_prob(batch_act)
-                entropy    = dir_dist.entropy().mean()
+                    # Discrete direction distribution
+                    dir_dist   = Categorical(logits=logits)
+                    new_lp_dir = dir_dist.log_prob(batch_act)
+                    entropy    = dir_dist.entropy().mean()
 
-                # Continuous SL/TP distributions (use policy's learnable std)
-                sl_std = self._policy.sl_log_std.exp().clamp(1.0, 200.0)
-                tp_std = self._policy.tp_log_std.exp().clamp(1.0, 400.0)
-                new_lp_sl = Normal(sl_mean, sl_std).log_prob(batch_sl)
-                new_lp_tp = Normal(tp_mean, tp_std).log_prob(batch_tp)
+                    # Continuous SL/TP distributions (use policy's learnable std)
+                    sl_std = self._policy.sl_log_std.exp().clamp(1.0, 200.0)
+                    tp_std = self._policy.tp_log_std.exp().clamp(1.0, 400.0)
+                    new_lp_sl = Normal(sl_mean, sl_std).log_prob(batch_sl)
+                    new_lp_tp = Normal(tp_mean, tp_std).log_prob(batch_tp)
 
-                # Direction-only ratio: SL/TP heads learn via shared backbone gradients
-                new_lp = new_lp_dir
+                    # Direction-only ratio: SL/TP heads learn via shared backbone gradients
+                    new_lp = new_lp_dir
 
-                ratio     = torch.exp(new_lp - batch_old_lp)
-                clip_frac = float(((ratio - 1.0).abs() > self.clip_eps).float().mean().item())
+                    ratio     = torch.exp(new_lp - batch_old_lp)
+                    clip_frac = float(((ratio - 1.0).abs() > self.clip_eps).float().mean().item())
 
-                surr1  = ratio * batch_adv
-                surr2  = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * batch_adv
-                l_clip = -torch.min(surr1, surr2).mean()
+                    surr1  = ratio * batch_adv
+                    surr2  = torch.clamp(ratio, 1.0 - self.clip_eps, 1.0 + self.clip_eps) * batch_adv
+                    l_clip = -torch.min(surr1, surr2).mean()
 
-                # Value loss with clipping (PPO standard)
-                v_clipped = batch_old_val_norm + torch.clamp(
-                    values - batch_old_val_norm, -self.clip_eps, self.clip_eps
-                )
-                l_val = 0.5 * torch.max(
-                    (values    - batch_norm_ret).pow(2),
-                    (v_clipped - batch_norm_ret).pow(2),
-                ).mean()
+                    # Value loss with clipping (PPO standard)
+                    v_clipped = batch_old_val_norm + torch.clamp(
+                        values - batch_old_val_norm, -self.clip_eps, self.clip_eps
+                    )
+                    l_val = 0.5 * torch.max(
+                        (values    - batch_norm_ret).pow(2),
+                        (v_clipped - batch_norm_ret).pow(2),
+                    ).mean()
 
-                loss = (
-                    l_clip
-                    + self.value_loss_coef * l_val
-                    - self.entropy_coef    * entropy
-                )
+                    loss = (
+                        l_clip
+                        + self.value_loss_coef * l_val
+                        - self.entropy_coef    * entropy
+                    )
 
-            # Pred loss computed in float32 outside amp_ctx to prevent bfloat16 overflow
-            batch_fwd_safe = batch_fwd.clamp(-0.05, 0.05).float()
-            l_pred = torch.nn.functional.mse_loss(pred_returns.float(), batch_fwd_safe)
-            loss = loss + self.pred_loss_coef * l_pred
+                # Pred loss computed in float32 outside amp_ctx to prevent bfloat16 overflow
+                batch_fwd_safe = batch_fwd.clamp(-0.05, 0.05).float()
+                l_pred = torch.nn.functional.mse_loss(pred_returns.float(), batch_fwd_safe)
+                loss = loss + self.pred_loss_coef * l_pred
 
-            self._scaler.scale(loss).backward()
-            self._scaler.unscale_(self.optimiser)
-            nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
-            self._scaler.step(self.optimiser)
-            self._scaler.update()
+                self._scaler.scale(loss).backward()
+                self._scaler.unscale_(self.optimiser)
+                nn.utils.clip_grad_norm_(self.model.parameters(), self.max_grad_norm)
+                self._scaler.step(self.optimiser)
+                self._scaler.update()
 
-            tot_policy  += l_clip.item()
-            tot_value   += l_val.item()
-            tot_entropy += entropy.item()
-            tot_pred    += l_pred.item()
-            tot_clip    += clip_frac
-            n_batches   += 1
+                tot_policy  += l_clip.item()
+                tot_value   += l_val.item()
+                tot_entropy += entropy.item()
+                tot_pred    += l_pred.item()
+                tot_clip    += clip_frac
+                n_batches   += 1
+
+            except torch.cuda.OutOfMemoryError:
+                # Drop this minibatch, clear partial gradients and fragmented cache.
+                # Halve the batch size so subsequent iterations can proceed.
+                self.optimiser.zero_grad()
+                torch.cuda.empty_cache()
+                self.minibatch_size = max(32, self.minibatch_size // 2)
+                print(f"  [OOM] minibatch_size → {self.minibatch_size} (skipping batch)")
+                continue
+
+        # Free the full rollout tensors from GPU now that all epochs are done.
+        del obs, actions, sl_samples, tp_samples, entered
+        del old_lp, norm_returns, old_vals_norm, advantages, actual_fwd
+        del dataset, loader
+        if self.device == "cuda":
+            torch.cuda.empty_cache()
 
         d = max(n_batches, 1)
         return {
