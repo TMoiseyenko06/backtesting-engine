@@ -617,6 +617,13 @@ def _parse_args() -> argparse.Namespace:
                         " intermediate price noise and turns training into a classification"
                         " problem: 'will price hit TP before SL?'  Recommended with"
                         " --sl-pts and --tp-pts.  Default: off.")
+    p.add_argument("--time-limit-bars", type=int, default=0, dest="time_limit_bars",
+                   metavar="BARS",
+                   help="Force-exit and penalise any trade that has not hit SL or TP within"
+                        " this many bars of entry.  0 = disabled (default).  Good value: 30"
+                        " (= 30 min on 1-min data).  Works with both standard and binary reward"
+                        " modes; in binary mode the penalty equals -1.0 (same as an SL hit)."
+                        " Trains the model to only enter when a fast, decisive move is expected.")
     p.add_argument("--sl-pts",  type=float, default=None, dest="sl_pts",
                    metavar="PTS",
                    help="Fixed SL distance in points (e.g. 100). Overrides model SL head."
@@ -732,6 +739,7 @@ def main() -> None:
                 win_bonus=args.win_bonus,
                 val_winrate_coef=args.val_winrate_coef,
                 binary_reward=args.binary_reward,
+                time_limit_bars=args.time_limit_bars,
             )
             rl_metrics = ppo_trainer.fit(train_bars, features)
             elapsed = time.time() - t0
@@ -766,6 +774,7 @@ def main() -> None:
             flat_penalty=args.flat_penalty,
             win_bonus=args.win_bonus,
             binary_reward=args.binary_reward,
+            time_limit_bars=args.time_limit_bars,
         )
         test_episodes = _build_test_episodes(
             test_bars, test_features, args.seq_len, args.prediction_horizon

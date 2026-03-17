@@ -48,11 +48,20 @@ Reward
     removes that noise and reduces the task to a classification problem:
     "will price hit TP before SL?"
 
-    In-bracket   : 0
-    Exit bar(TP) : +(win_bonus or reward_scale) / reward_scale  ≈ +1.0
-    Exit bar(SL) : -(win_bonus or reward_scale) / reward_scale  ≈ -1.0
-    Flat bar     : -flat_penalty / reward_scale  (same as standard mode)
-    Commissions  : omitted (constant cost; adds noise without information)
+    In-bracket      : 0
+    Exit bar(TP)    : +(win_bonus or reward_scale) / reward_scale  ≈ +1.0
+    Exit bar(SL)    : -(win_bonus or reward_scale) / reward_scale  ≈ -1.0
+    Exit bar(timeout): -(win_bonus or reward_scale) / reward_scale ≈ -1.0
+    Flat bar        : -flat_penalty / reward_scale  (same as standard mode)
+    Commissions     : omitted (constant cost; adds noise without information)
+
+Time-limit timeout (time_limit_bars > 0):
+    If a bracket trade has not been resolved by SL or TP within time_limit_bars
+    bars of entry, it is force-closed at the current bar's close and penalised
+    as a loss.  In binary mode this gives -1.0; in standard mode the MTM at
+    close is used (same as an EOD exit).  This trains the model to only enter
+    when it expects a fast, decisive move — avoiding "stuck" trades that tie
+    up capital without resolving.
 """
 
 from __future__ import annotations
@@ -170,24 +179,27 @@ class BatchedTradingEnv:
         contracts:    float = 1.0,
         max_loss:     float = 2_500.0,
         reward_scale: float = 100.0,
-        flat_penalty:   float = 0.0,
-        win_bonus:      float = 0.0,
-        binary_reward:  bool  = False,
+        flat_penalty:    float = 0.0,
+        win_bonus:       float = 0.0,
+        binary_reward:   bool  = False,
+        time_limit_bars: int   = 0,    # 0 = disabled; >0 = force exit + penalty after N bars
     ) -> None:
-        self.n_envs        = n_envs
-        self.seq_len       = seq_len
-        self.n_features    = n_features
-        self.state_dim     = n_features + TradingEnv.N_EXTRA
-        self.multiplier    = multiplier
-        self.commission    = commission
-        self.contracts     = contracts
-        self.max_loss      = max_loss
-        self.reward_scale  = reward_scale
-        self.flat_penalty  = flat_penalty
-        self.win_bonus     = win_bonus
-        self.binary_reward = binary_reward
-        self.tp_hit_total = 0
-        self.sl_hit_total = 0
+        self.n_envs          = n_envs
+        self.seq_len         = seq_len
+        self.n_features      = n_features
+        self.state_dim       = n_features + TradingEnv.N_EXTRA
+        self.multiplier      = multiplier
+        self.commission      = commission
+        self.contracts       = contracts
+        self.max_loss        = max_loss
+        self.reward_scale    = reward_scale
+        self.flat_penalty    = flat_penalty
+        self.win_bonus       = win_bonus
+        self.binary_reward   = binary_reward
+        self.time_limit_bars = time_limit_bars
+        self.tp_hit_total      = 0
+        self.sl_hit_total      = 0
+        self.timeout_hit_total = 0
 
         # Allocated in reset_all — episode data (padded 2D arrays)
         self._features  : np.ndarray | None = None  # (n, max_bars, n_features)
@@ -197,14 +209,15 @@ class BatchedTradingEnv:
         self._lengths   : np.ndarray | None = None  # (n,) int32
 
         # Per-environment state
-        self._cursors     : np.ndarray | None = None  # (n,) int32
-        self._positions   : np.ndarray | None = None  # (n,) int32  {-1,0,+1}
-        self._entry_prices: np.ndarray | None = None  # (n,) float32
-        self._sl_prices   : np.ndarray | None = None  # (n,) float32 absolute SL
-        self._tp_prices   : np.ndarray | None = None  # (n,) float32 absolute TP
-        self._in_bracket  : np.ndarray | None = None  # (n,) bool
-        self._prev_closes : np.ndarray | None = None  # (n,) float32 for MTM
-        self._ei          : np.ndarray | None = None  # np.arange(n), cached
+        self._cursors      : np.ndarray | None = None  # (n,) int32
+        self._positions    : np.ndarray | None = None  # (n,) int32  {-1,0,+1}
+        self._entry_prices : np.ndarray | None = None  # (n,) float32
+        self._sl_prices    : np.ndarray | None = None  # (n,) float32 absolute SL
+        self._tp_prices    : np.ndarray | None = None  # (n,) float32 absolute TP
+        self._in_bracket   : np.ndarray | None = None  # (n,) bool
+        self._prev_closes  : np.ndarray | None = None  # (n,) float32 for MTM
+        self._bars_in_trade: np.ndarray | None = None  # (n,) int32 — bars elapsed since entry
+        self._ei           : np.ndarray | None = None  # np.arange(n), cached
 
     # ------------------------------------------------------------------
 
@@ -233,16 +246,18 @@ class BatchedTradingEnv:
             self._lows    [i, :L] = lows.astype(np.float32)
             self._lengths [i]     = L
 
-        self._ei           = np.arange(n)
-        self._cursors      = np.full(n, self.seq_len, dtype=np.int32)
-        self._positions    = np.zeros(n, dtype=np.int32)
-        self._entry_prices = np.zeros(n, dtype=np.float32)
-        self._sl_prices    = np.zeros(n, dtype=np.float32)
-        self._tp_prices    = np.zeros(n, dtype=np.float32)
-        self._in_bracket   = np.zeros(n, dtype=bool)
-        self._prev_closes  = self._prices[self._ei, self.seq_len - 1]
-        self.tp_hit_total  = 0
-        self.sl_hit_total  = 0
+        self._ei             = np.arange(n)
+        self._cursors        = np.full(n, self.seq_len, dtype=np.int32)
+        self._positions      = np.zeros(n, dtype=np.int32)
+        self._entry_prices   = np.zeros(n, dtype=np.float32)
+        self._sl_prices      = np.zeros(n, dtype=np.float32)
+        self._tp_prices      = np.zeros(n, dtype=np.float32)
+        self._in_bracket     = np.zeros(n, dtype=bool)
+        self._bars_in_trade  = np.zeros(n, dtype=np.int32)
+        self._prev_closes    = self._prices[self._ei, self.seq_len - 1]
+        self.tp_hit_total      = 0
+        self.sl_hit_total      = 0
+        self.timeout_hit_total = 0
         return self._build_states()
 
     # ------------------------------------------------------------------
@@ -292,10 +307,21 @@ class BatchedTradingEnv:
             (in_b & short_pos & (bar_lows  <= self._tp_prices))
         )
         # If both hit on same bar, SL takes precedence (conservative)
-        tp_hit       = tp_hit & ~sl_hit
-        bracket_exit = sl_hit | tp_hit
-        self.tp_hit_total += int(tp_hit.sum())
-        self.sl_hit_total += int(sl_hit.sum())
+        tp_hit = tp_hit & ~sl_hit
+
+        # ── 1b. Time-limit timeout ─────────────────────────────────────
+        # If the trade hasn't resolved within time_limit_bars bars, force
+        # exit at the current close and penalise like an SL hit.  Teaches
+        # the model to only enter when it expects a fast, decisive move.
+        if self.time_limit_bars > 0:
+            timeout_hit = in_b & (self._bars_in_trade >= self.time_limit_bars) & ~sl_hit & ~tp_hit
+        else:
+            timeout_hit = np.zeros(self.n_envs, dtype=bool)
+
+        bracket_exit = sl_hit | tp_hit | timeout_hit
+        self.tp_hit_total      += int(tp_hit.sum())
+        self.sl_hit_total      += int(sl_hit.sum())
+        self.timeout_hit_total += int(timeout_hit.sum())
 
         # ── 2. MTM reward using actual exit price for bracket exits ────
         # For bars where SL fires, price moved to sl_price; for TP, to tp_price.
@@ -341,16 +367,15 @@ class BatchedTradingEnv:
         if self.binary_reward:
             # Binary mode: with fixed SL/TP, P&L is a linear function of win rate.
             # Bar-by-bar MTM is pure noise — only the bracket outcome matters.
-            # Reward the model +1 for TP, -1 for SL, 0 while in-bracket.
-            # Commissions are constant and carry no directional information, so
-            # they are omitted to keep the gradient signal clean.
+            # TP → +1,  SL → -1,  timeout → -1 (failed to pick a decisive move).
             binary_scale = self.win_bonus if self.win_bonus > 0.0 else self.reward_scale
-            rewards = (
-                (tp_hit.astype(np.float32) - sl_hit.astype(np.float32)) * binary_scale
-                - flat_cost
-            ) / self.reward_scale
+            outcome = (tp_hit.astype(np.float32)
+                       - sl_hit.astype(np.float32)
+                       - timeout_hit.astype(np.float32))
+            rewards = (outcome * binary_scale - flat_cost) / self.reward_scale
         else:
             # Standard mode: full MTM + commission signal.
+            # timeout exits at current close (effective_price already = curr_closes for non-SL/TP).
             win_loss_bonus = (tp_hit.astype(np.float32) - sl_hit.astype(np.float32)) * self.win_bonus
             rewards = (mtm - exit_commission - flat_cost + win_loss_bonus) / self.reward_scale
             # Entry commission
@@ -365,6 +390,21 @@ class BatchedTradingEnv:
         self._in_bracket   = new_in_b
         self._prev_closes  = curr_closes
         self._cursors     += 1
+
+        # Update bars-in-trade counter:
+        #   exited (any reason) or EOD → 0
+        #   new entry this bar         → 1
+        #   still in bracket           → old + 1
+        #   flat                       → 0
+        self._bars_in_trade = np.where(
+            bracket_exit,
+            np.int32(0),
+            np.where(can_enter,
+                     np.int32(1),
+                     np.where(new_in_b,
+                              self._bars_in_trade + np.int32(1),
+                              np.int32(0))),
+        )
 
         # ── 6. EOD forced flat ─────────────────────────────────────────
         dones          = self._cursors >= self._lengths

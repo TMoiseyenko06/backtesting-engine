@@ -128,6 +128,7 @@ class PPOTrainer:
         win_bonus:           float = 0.0,   # $ bonus on TP hit / penalty on SL hit
         val_winrate_coef:    float = 0.0,   # winrate weight in model selection score
         binary_reward:       bool  = False, # replace MTM with ±1 on TP/SL; pure win-rate signal
+        time_limit_bars:     int   = 0,     # force exit + penalty if trade unresolved after N bars
     ) -> None:
         self.fixed_sl_pts       = fixed_sl_pts
         self.fixed_tp_pts       = fixed_tp_pts
@@ -164,6 +165,7 @@ class PPOTrainer:
             flat_penalty=flat_penalty,
             win_bonus=win_bonus,
             binary_reward=binary_reward,
+            time_limit_bars=time_limit_bars,
         )
         self._env = TradingEnv(**self._env_kwargs)   # kept for external callers
 
@@ -381,7 +383,7 @@ class PPOTrainer:
         Run the current policy greedily on val_episodes.
         Returns (composite_score, winrate).
           composite_score = mean_daily_pnl + val_winrate_coef * winrate
-          winrate         = tp_hits / (tp_hits + sl_hits), or 0.5 if no trades.
+          winrate         = tp_hits / (tp_hits + sl_hits + timeouts), or 0.5 if no trades.
         """
         self._policy.eval()
         n_ep        = len(val_episodes)
@@ -418,7 +420,7 @@ class PPOTrainer:
                 active_mask &= ~dones
 
         pnl        = float(ep_rets.mean()) * self.reward_scale
-        total_bkt  = env.tp_hit_total + env.sl_hit_total
+        total_bkt  = env.tp_hit_total + env.sl_hit_total + env.timeout_hit_total
         winrate    = env.tp_hit_total / total_bkt if total_bkt > 0 else 0.5
         score      = pnl + self.val_winrate_coef * winrate
         return score, winrate
