@@ -27,18 +27,32 @@ Actions / directions
 
 Reward
 ------
-  Entry bar    : -entry_commission / reward_scale
-  In-bracket   : MTM change (close - prev_close) * pos * multiplier / reward_scale
-  Exit bar(SL) : (sl_price - prev_close) * pos * multiplier / reward_scale
-                 - exit_commission / reward_scale
-  Exit bar(TP) : (tp_price - prev_close) * pos * multiplier / reward_scale
-                 - exit_commission / reward_scale
-  EOD exit     : (close - prev_close) * pos * multiplier / reward_scale
-                 - exit_commission / reward_scale
+  Standard mode (binary_reward=False):
+    Entry bar    : -entry_commission / reward_scale
+    In-bracket   : MTM change (close - prev_close) * pos * multiplier / reward_scale
+    Exit bar(SL) : (sl_price - prev_close) * pos * multiplier / reward_scale
+                   - exit_commission / reward_scale
+    Exit bar(TP) : (tp_price - prev_close) * pos * multiplier / reward_scale
+                   - exit_commission / reward_scale
+    EOD exit     : (close - prev_close) * pos * multiplier / reward_scale
+                   - exit_commission / reward_scale
 
-  Total bracket reward = (exit_price - entry_price) * direction
-                         * multiplier * contracts / reward_scale
-                         - 2 * commission / reward_scale
+    Total bracket reward = (exit_price - entry_price) * direction
+                           * multiplier * contracts / reward_scale
+                           - 2 * commission / reward_scale
+
+  Binary mode (binary_reward=True):
+    With fixed SL/TP, P&L is a pure linear function of win rate, so maximising
+    P&L IS maximising win rate.  The bar-by-bar MTM signal is pure noise —
+    intermediate wiggles don't affect the final TP/SL outcome.  Binary mode
+    removes that noise and reduces the task to a classification problem:
+    "will price hit TP before SL?"
+
+    In-bracket   : 0
+    Exit bar(TP) : +(win_bonus or reward_scale) / reward_scale  ≈ +1.0
+    Exit bar(SL) : -(win_bonus or reward_scale) / reward_scale  ≈ -1.0
+    Flat bar     : -flat_penalty / reward_scale  (same as standard mode)
+    Commissions  : omitted (constant cost; adds noise without information)
 """
 
 from __future__ import annotations
@@ -81,8 +95,9 @@ class TradingEnv:
         contracts:    float = 1.0,
         max_loss:     float = 2_500.0,
         reward_scale: float = 100.0,
-        flat_penalty: float = 0.0,
-        win_bonus:    float = 0.0,
+        flat_penalty:   float = 0.0,
+        win_bonus:      float = 0.0,
+        binary_reward:  bool  = False,
     ) -> None:
         self.seq_len      = seq_len
         self.n_features   = n_features
@@ -155,20 +170,22 @@ class BatchedTradingEnv:
         contracts:    float = 1.0,
         max_loss:     float = 2_500.0,
         reward_scale: float = 100.0,
-        flat_penalty: float = 0.0,
-        win_bonus:    float = 0.0,
+        flat_penalty:   float = 0.0,
+        win_bonus:      float = 0.0,
+        binary_reward:  bool  = False,
     ) -> None:
-        self.n_envs       = n_envs
-        self.seq_len      = seq_len
-        self.n_features   = n_features
-        self.state_dim    = n_features + TradingEnv.N_EXTRA
-        self.multiplier   = multiplier
-        self.commission   = commission
-        self.contracts    = contracts
-        self.max_loss     = max_loss
-        self.reward_scale = reward_scale
-        self.flat_penalty = flat_penalty
-        self.win_bonus    = win_bonus
+        self.n_envs        = n_envs
+        self.seq_len       = seq_len
+        self.n_features    = n_features
+        self.state_dim     = n_features + TradingEnv.N_EXTRA
+        self.multiplier    = multiplier
+        self.commission    = commission
+        self.contracts     = contracts
+        self.max_loss      = max_loss
+        self.reward_scale  = reward_scale
+        self.flat_penalty  = flat_penalty
+        self.win_bonus     = win_bonus
+        self.binary_reward = binary_reward
         self.tp_hit_total = 0
         self.sl_hit_total = 0
 
@@ -321,16 +338,24 @@ class BatchedTradingEnv:
         # Re-compute using can_enter so entry bars are excluded.
         flat_cost = ((post_exit_pos == 0) & ~can_enter).astype(np.float32) * self.flat_penalty
 
-        # Win/loss bonus: extra reward signal for *how* the bracket closed,
-        # independent of dollar P&L. Encourages the model to be selective and
-        # only enter when it expects to hit TP (important for prop firm winrate).
-        win_loss_bonus = (tp_hit.astype(np.float32) - sl_hit.astype(np.float32)) * self.win_bonus
-
-        rewards   = (mtm - exit_commission - flat_cost + win_loss_bonus) / self.reward_scale
-
-        # Entry commission
-        rewards -= (can_enter.astype(np.float32)
-                    * self.commission * self.contracts / self.reward_scale)
+        if self.binary_reward:
+            # Binary mode: with fixed SL/TP, P&L is a linear function of win rate.
+            # Bar-by-bar MTM is pure noise — only the bracket outcome matters.
+            # Reward the model +1 for TP, -1 for SL, 0 while in-bracket.
+            # Commissions are constant and carry no directional information, so
+            # they are omitted to keep the gradient signal clean.
+            binary_scale = self.win_bonus if self.win_bonus > 0.0 else self.reward_scale
+            rewards = (
+                (tp_hit.astype(np.float32) - sl_hit.astype(np.float32)) * binary_scale
+                - flat_cost
+            ) / self.reward_scale
+        else:
+            # Standard mode: full MTM + commission signal.
+            win_loss_bonus = (tp_hit.astype(np.float32) - sl_hit.astype(np.float32)) * self.win_bonus
+            rewards = (mtm - exit_commission - flat_cost + win_loss_bonus) / self.reward_scale
+            # Entry commission
+            rewards -= (can_enter.astype(np.float32)
+                        * self.commission * self.contracts / self.reward_scale)
 
         # ── 5. Commit state ────────────────────────────────────────────
         self._positions    = new_pos.astype(np.int32)
@@ -345,9 +370,11 @@ class BatchedTradingEnv:
         dones          = self._cursors >= self._lengths
         eod_in_bracket = dones & self._in_bracket
 
-        # EOD exit: pays exit commission (entry was already paid at bracket open)
-        rewards -= (eod_in_bracket.astype(np.float32)
-                    * self.commission * self.contracts / self.reward_scale)
+        # EOD exit: pays exit commission in standard mode only.
+        # Binary mode omits commissions — they are constant and add no signal.
+        if not self.binary_reward:
+            rewards -= (eod_in_bracket.astype(np.float32)
+                        * self.commission * self.contracts / self.reward_scale)
 
         self._positions    = np.where(dones, np.int32(0),     self._positions)
         self._entry_prices = np.where(dones, np.float32(0.0), self._entry_prices)

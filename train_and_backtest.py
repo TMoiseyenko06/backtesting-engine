@@ -329,8 +329,10 @@ def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
     model.eval()
     reward_scale = env_kwargs["reward_scale"]
 
-    # During the test we measure real P&L — no flat_penalty training artifact.
-    bt_kwargs = {**env_kwargs, "flat_penalty": 0.0}
+    # During the test we measure real P&L — strip training artifacts:
+    # flat_penalty, win_bonus, and binary_reward all distort the rew_dollars
+    # accumulator used for day_pnl/trade_pnl tracking below.
+    bt_kwargs = {**env_kwargs, "flat_penalty": 0.0, "win_bonus": 0.0, "binary_reward": False}
 
     daily_pnls: list[float] = []
     trade_pnls: list[float] = []
@@ -605,6 +607,13 @@ def _parse_args() -> argparse.Namespace:
                         " The best checkpoint saved is now the one with the highest combined score."
                         " E.g. 5000 means a 10%% winrate improvement is worth $500/day in selection."
                         " Default: 0 (select purely on P&L).")
+    p.add_argument("--binary-reward",  action="store_true", default=False, dest="binary_reward",
+                   help="Replace bar-by-bar MTM reward with a pure ±1 win/loss signal."
+                        " With fixed --sl-pts/--tp-pts, P&L is a linear function of win rate,"
+                        " so maximising P&L IS maximising win rate.  Binary mode removes"
+                        " intermediate price noise and turns training into a classification"
+                        " problem: 'will price hit TP before SL?'  Recommended with"
+                        " --sl-pts and --tp-pts.  Default: off.")
     p.add_argument("--sl-pts",  type=float, default=None, dest="sl_pts",
                    metavar="PTS",
                    help="Fixed SL distance in points (e.g. 100). Overrides model SL head."
@@ -719,6 +728,7 @@ def main() -> None:
                 fixed_tp_pts=args.tp_pts,
                 win_bonus=args.win_bonus,
                 val_winrate_coef=args.val_winrate_coef,
+                binary_reward=args.binary_reward,
             )
             rl_metrics = ppo_trainer.fit(train_bars, features)
             elapsed = time.time() - t0
@@ -752,6 +762,7 @@ def main() -> None:
             reward_scale=100.0,
             flat_penalty=args.flat_penalty,
             win_bonus=args.win_bonus,
+            binary_reward=args.binary_reward,
         )
         test_episodes = _build_test_episodes(
             test_bars, test_features, args.seq_len, args.prediction_horizon

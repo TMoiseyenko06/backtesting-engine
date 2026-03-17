@@ -127,6 +127,7 @@ class PPOTrainer:
         fixed_tp_pts:        Optional[float] = None,  # if set, override model TP output
         win_bonus:           float = 0.0,   # $ bonus on TP hit / penalty on SL hit
         val_winrate_coef:    float = 0.0,   # winrate weight in model selection score
+        binary_reward:       bool  = False, # replace MTM with ±1 on TP/SL; pure win-rate signal
     ) -> None:
         self.fixed_sl_pts       = fixed_sl_pts
         self.fixed_tp_pts       = fixed_tp_pts
@@ -162,6 +163,7 @@ class PPOTrainer:
             reward_scale=reward_scale,
             flat_penalty=flat_penalty,
             win_bonus=win_bonus,
+            binary_reward=binary_reward,
         )
         self._env = TradingEnv(**self._env_kwargs)   # kept for external callers
 
