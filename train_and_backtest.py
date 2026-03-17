@@ -380,8 +380,13 @@ def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
                 # ── Track individual trade P&L ──────────────────────────
                 if entered[0]:
                     n_trades += 1
+                    entry_comm_dollars = env.commission * env.contracts
                     if in_trade:
-                        # Previous bracket closed AND new entry in same bar
+                        # Previous bracket closed AND new entry in same bar.
+                        # rew_dollars = old_exit_mtm - exit_comm - entry_comm
+                        # Old trade's correct final-bar P&L = rew_dollars + entry_comm
+                        trade_pnl_acc += rew_dollars + entry_comm_dollars
+                        exit_type = "TP" if trade_pnl_acc > 0 else "SL"
                         trade_pnls.append(trade_pnl_acc)
                         trade_log.append({
                             "entry_time":  entry_ts,
@@ -390,11 +395,11 @@ def _nn_backtest(model, test_episodes: list, env_kwargs: dict,
                             "entry_price": entry_price,
                             "sl_price":    entry_sl,
                             "tp_price":    entry_tp,
-                            "exit_type":   "EOD",
+                            "exit_type":   exit_type,
                             "pnl":         round(trade_pnl_acc, 2),
                         })
                     in_trade      = True
-                    trade_pnl_acc = rew_dollars          # includes -entry_commission
+                    trade_pnl_acc = -entry_comm_dollars  # new trade: only entry commission
                     entry_ts      = bar_ts
                     entry_price   = float(env._entry_prices[0])
                     entry_dir     = int(directions[0])
